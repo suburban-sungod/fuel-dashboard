@@ -300,9 +300,14 @@ function renderFlags(t, tot) {
     add('warn', `<b>${short.length} ${short.length === 1 ? 'meal' : 'meals'} under ${state.athlete.protein_min_per_meal_g}g protein.</b> Distribution matters as much as the daily total — ${short.map((m) => hhmm(m.start)).join(', ')}.`);
   }
 
-  const unparsed = today().entries.filter((e) => e.source === 'freetext');
-  if (unparsed.length) {
-    add('', `<b>${unparsed.length} unparsed ${unparsed.length === 1 ? 'entry' : 'entries'}.</b> Macros are missing until you run <code>/food-diary</code> at the Mac. Today's totals are understated.`);
+  const pendingEntries = today().entries.filter((e) => e.source === 'freetext' && e.parse_state !== 'failed');
+  if (pendingEntries.length) {
+    add('', `<b>${pendingEntries.length} ${pendingEntries.length === 1 ? 'entry' : 'entries'} still estimating.</b> Usually about 20 seconds. Today's totals are understated until ${pendingEntries.length === 1 ? 'it lands' : 'they land'}.`);
+  }
+
+  const failedEntries = today().entries.filter((e) => e.parse_state === 'failed');
+  if (failedEntries.length) {
+    add('bad', `<b>${failedEntries.length} ${failedEntries.length === 1 ? 'entry' : 'entries'} couldn't be estimated.</b> Delete and re-enter with macros, or fix at the Mac. Today's totals are understated.`);
   }
 
   // A sync that quietly died looks exactly like a rest week, so say so out loud.
@@ -339,11 +344,24 @@ function renderEntries() {
     box.appendChild(head);
 
     for (const e of m.entries) {
-      const row = el('div', 'entry' + (e.source === 'freetext' ? ' unparsed' : ''));
+      const failed = e.parse_state === 'failed';
+      const pending = e.source === 'freetext' && !failed;
+      const row = el('div', 'entry' + (pending ? ' pending' : '') + (failed ? ' failed' : ''));
+
+      let macros;
+      if (pending) macros = '<span class="spin"></span>estimating macros…';
+      else if (failed) macros = `couldn't estimate — ${escapeHtml(e.parse_error || 'unknown error')}`;
+      else {
+        macros = `${num(e.kcal)} kcal · ${num(e.protein)}P · ${num(e.carbs)}C · ${num(e.fat)}F`;
+        if (e.source === 'parsed') macros += ` · <em class="tag">est${e.confidence === 'low' ? ' (rough)' : ''}</em>`;
+        if (e.source === 'matched') macros += ' · <em class="tag">matched</em>';
+      }
+
       row.innerHTML = `<time>${e.time}</time>
         <div class="e-main">
           <div class="e-label">${escapeHtml(e.label)}</div>
-          <div class="e-macros">${e.kcal ? `${num(e.kcal)} kcal · ${num(e.protein)}P · ${num(e.carbs)}C · ${num(e.fat)}F` : 'macros not parsed yet'}</div>
+          <div class="e-macros">${macros}</div>
+          ${e.note ? `<div class="e-note">${escapeHtml(e.note)}</div>` : ''}
         </div>`;
       const del = el('button', 'e-del', '×');
       del.onclick = () => {
@@ -684,17 +702,63 @@ function addCustom() {
   if (!label) return;
   const kcal = Number($('#c-kcal').value) || 0;
   const day = today();
-  const entry = {
-    id: Math.random().toString(36).slice(2, 8),
-    time: $('#entry-time').value || '12:00',
-    label,
-    kcal, protein: Number($('#c-protein').value) || 0,
-    carbs: Number($('#c-carbs').value) || 0, fat: Number($('#c-fat').value) || 0,
-    source: kcal ? 'manual' : 'freetext', note: '',
-  };
+  const time = $('#entry-time').value || '12:00';
+  const id = Math.random().toString(36).slice(2, 8);
+
+  let entry;
+  if (kcal) {
+    // Macros typed in by hand — take them as given.
+    entry = {
+      id, time, label, kcal,
+      protein: Number($('#c-protein').value) || 0,
+      carbs: Number($('#c-carbs').value) || 0,
+      fat: Number($('#c-fat').value) || 0,
+      source: 'manual', note: '',
+    };
+  } else {
+    // No macros: try Matt's own food list on-device first. Instant, free, offline, and it
+    // resolves most of what he actually types because his eating is repetitive.
+    const hit = F.matchEntry(label, state.templates);
+    entry = hit
+      ? { id, time, label: hit.label, kcal: hit.kcal, protein: hit.protein, carbs: hit.carbs,
+          fat: hit.fat, source: 'matched', note: hit.anyEstimate ? 'includes an estimated item' : '' }
+      : { id, time, label, kcal: 0, protein: 0, carbs: 0, fat: 0,
+          source: 'freetext', parse_state: 'pending', note: '' };
+  }
+
   saveDay({ ...day, entries: [...day.entries, entry].sort((a, b) => a.time.localeCompare(b.time)) });
   ['#c-label', '#c-kcal', '#c-protein', '#c-carbs', '#c-fat'].forEach((s) => ($(s).value = ''));
   closeSheet();
+  if (entry.source === 'freetext') pollForParse(day.date || state.date, entry.id);
+}
+
+/**
+ * Wait for the GitHub Actions parser to fill in a free-text entry. Polls the month file
+ * for 90s, which comfortably covers the ~20s round trip. Skips a tick while a local write
+ * is still queued, so a fresh read can never clobber an entry that hasn't synced yet.
+ */
+async function pollForParse(date, entryId) {
+  const key = date.slice(0, 7);
+  for (let i = 0; i < 18; i++) {
+    await new Promise((r) => setTimeout(r, 5000));
+    if (S.pendingCount()) continue;
+    let month;
+    try {
+      month = await S.readJSON(S.paths.month(date), null);
+    } catch {
+      continue;
+    }
+    const entry = (month?.days?.[date]?.entries || []).find((e) => e.id === entryId);
+    if (!entry) continue;
+    if (entry.source === 'freetext' && entry.parse_state !== 'failed') continue;
+
+    state.months[key] = month;
+    for (const [d, day] of Object.entries(month.days || {})) {
+      state.logs[d] = { date: d, entries: [], confounders: [], notes: '', ...day };
+    }
+    render();
+    return;
+  }
 }
 
 function logWeight() {

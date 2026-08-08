@@ -372,3 +372,128 @@ export function carbRate(durationMin, intensityFactor, athlete) {
       : null,
   };
 }
+
+// ---------- on-device text matching ----------
+//
+// Resolves typed entries against Matt's own food list before any API call is considered.
+// Deliberately strict and all-or-nothing: a fragment it cannot resolve exactly fails the
+// whole match and the entry falls through to the LLM parser. Partial credit would silently
+// understate a day's intake, which is the failure mode this dashboard exists to prevent.
+
+const FILLER = new Set(['a', 'an', 'the', 'some', 'of', 'my', 'plain', 'just']);
+
+const NUMBER_WORDS = {
+  half: 0.5, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6,
+  seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12,
+  couple: 2, pair: 2, dozen: 12,
+};
+
+function normalise(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[.!?]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Pull a leading quantity off a fragment. Returns [qty, rest]. */
+function takeQuantity(text) {
+  const m = /^(\d+(?:\.\d+)?|[a-z]+)\s+(.*)$/.exec(text);
+  if (!m) return [1, text];
+  const [, head, rest] = m;
+  if (/^\d/.test(head)) return [Number(head), rest];
+  if (head in NUMBER_WORDS) return [NUMBER_WORDS[head], rest];
+  if (head === 'a' || head === 'an') return [1, rest];
+  return [1, text];
+}
+
+function stripFiller(text) {
+  return text.split(' ').filter((w) => w && !FILLER.has(w)).join(' ');
+}
+
+/** Longest alias that exactly equals the cleaned text, or null. */
+function exactItem(text, items) {
+  let best = null;
+  for (const item of items) {
+    for (const alias of item.aliases || []) {
+      const a = stripFiller(normalise(alias));
+      const hit = a === text || singular(a) === singular(text);
+      if (hit && (!best || a.length > best.aliasLength)) {
+        best = { item, aliasLength: a.length };
+      }
+    }
+  }
+  return best ? best.item : null;
+}
+
+/** Singularise a trailing plural so "2 bananas" resolves like "2 banana". */
+function singular(text) {
+  return text
+    .split(' ')
+    .map((w) => (w.length > 3 && w.endsWith('s') && !w.endsWith('ss') ? w.slice(0, -1) : w))
+    .join(' ');
+}
+
+function scale(item, qty) {
+  const per = item.unit_count || 1;
+  const f = qty / per;
+  return {
+    id: item.id,
+    label: item.label,
+    qty,
+    kcal: Math.round(item.kcal * f),
+    protein: Math.round(item.protein * f * 10) / 10,
+    carbs: Math.round(item.carbs * f * 10) / 10,
+    fat: Math.round(item.fat * f * 10) / 10,
+    estimate: item.source === 'estimate',
+  };
+}
+
+/**
+ * Try to resolve free text locally. Returns null when it can't — that is the signal to
+ * fall through to the API parser, not a failure.
+ */
+export function matchEntry(text, templates) {
+  const raw = normalise(text);
+  if (!raw) return null;
+
+  // 1. Whole-text match against a meal template ("eggs on toast", "tuna on rye").
+  //    Done first because meal phrases contain connectors that step 2 would split on.
+  const [mealQty, mealRest] = takeQuantity(raw);
+  const meal = exactItem(stripFiller(mealRest), templates.meals || []);
+  if (meal) {
+    const item = scale(meal, mealQty);
+    return { items: [item], ...totalsOf([item]), label: labelOf([item]) };
+  }
+
+  // 2. Otherwise split on connectors and resolve each fragment against single items.
+  const fragments = raw
+    .split(/\s*(?:,|\+|\band\b|\bwith\b|\bplus\b)\s*/)
+    .map((f) => f.trim())
+    .filter(Boolean);
+  if (!fragments.length) return null;
+
+  const items = [];
+  for (const fragment of fragments) {
+    const [qty, rest] = takeQuantity(fragment);
+    const single = exactItem(stripFiller(rest), templates.singles || []);
+    if (!single) return null; // all-or-nothing
+    items.push(scale(single, qty));
+  }
+
+  return { items, ...totalsOf(items), label: labelOf(items) };
+}
+
+function totalsOf(items) {
+  return {
+    kcal: items.reduce((s, i) => s + i.kcal, 0),
+    protein: Math.round(items.reduce((s, i) => s + i.protein, 0) * 10) / 10,
+    carbs: Math.round(items.reduce((s, i) => s + i.carbs, 0) * 10) / 10,
+    fat: Math.round(items.reduce((s, i) => s + i.fat, 0) * 10) / 10,
+    anyEstimate: items.some((i) => i.estimate),
+  };
+}
+
+function labelOf(items) {
+  return items.map((i) => (i.qty !== 1 ? `${i.qty}x ${i.label}` : i.label)).join(' + ');
+}
