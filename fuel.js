@@ -89,15 +89,40 @@ export function activityConfidence(workouts) {
 
 // ---------- day classification ----------
 
+/**
+ * Intensity factor. TrainingPeaks supplies one for structured plans; Strava never does,
+ * so derive it from normalised power (falling back to average) over FTP.
+ */
+export function rideIntensity(w, athlete) {
+  if (w.if) return w.if;
+  const watts = w.np_watts || w.avg_watts;
+  if (watts && athlete?.ftp) return watts / athlete.ftp;
+  return 0;
+}
+
+/**
+ * Training Stress Score. Strava's `suffer_score` is Relative Effort — a heart-rate
+ * derived number on a completely different scale — so it must never be treated as TSS.
+ * A 142-minute gravel ride reported Relative Effort 32 where the real TSS was near 70;
+ * trusting it meant the "high day" gate could essentially never fire.
+ */
+export function rideTSS(w, athlete) {
+  const inten = rideIntensity(w, athlete);
+  if (!inten || !w.duration_min) return 0;
+  return (w.duration_min / 60) * inten * inten * 100;
+}
+
+const NON_FUELLED = new Set(['strength', 'swim', 'other']);
+
 /** rest | moderate | high, from measured ride data where available, else the plan. */
-export function dayType(workouts, planned) {
-  const rides = (workouts || []).filter((w) => w.type !== 'strength');
-  const src = rides.length ? rides : (planned || []).filter((p) => p.type !== 'strength');
-  if (!src.length) return { type: 'rest', basis: workouts?.length ? 'strength only' : 'no activity' };
+export function dayType(workouts, planned, athlete) {
+  const rides = (workouts || []).filter((w) => !NON_FUELLED.has(w.type));
+  const src = rides.length ? rides : (planned || []).filter((p) => !NON_FUELLED.has(p.type));
+  if (!src.length) return { type: 'rest', basis: workouts?.length ? 'non-ride session only' : 'no activity' };
 
   const dur = src.reduce((s, w) => s + (w.duration_min || 0), 0);
-  const tss = src.reduce((s, w) => s + (w.tss || 0), 0);
-  const intensity = Math.max(...src.map((w) => w.if || 0));
+  const tss = src.reduce((s, w) => s + (w.tss || rideTSS(w, athlete)), 0);
+  const intensity = Math.max(...src.map((w) => rideIntensity(w, athlete)));
   const basis = rides.length ? 'measured' : 'planned';
 
   if (dur < 30) return { type: 'rest', basis };
@@ -147,7 +172,7 @@ export function targetsFor(iso, { athlete, weights, workouts, planned }) {
     protein_target: kg ? Math.round(gPerKg * kg) : null,
     protein_min: kg ? Math.round(lo * kg) : null,
     protein_max: kg ? Math.round(hi * kg) : null,
-    day: dayType(dayWorkouts, dayPlanned),
+    day: dayType(dayWorkouts, dayPlanned, athlete),
     workouts: dayWorkouts,
     planned: dayPlanned,
   };

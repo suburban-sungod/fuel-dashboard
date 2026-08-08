@@ -336,8 +336,8 @@ function renderPlan() {
   box.innerHTML = '';
   const line = (h) => box.appendChild(el('div', 'flag', h));
 
-  const src = t.workouts.filter((w) => w.type !== 'strength');
-  const plan = t.planned.filter((p) => p.type !== 'strength');
+  const src = t.workouts.filter((w) => !['strength', 'swim', 'other'].includes(w.type));
+  const plan = t.planned.filter((p) => !['strength', 'swim', 'other'].includes(p.type));
   const ride = src[0] || plan[0];
 
   if (t.kcal_target) {
@@ -348,7 +348,7 @@ function renderPlan() {
   }
 
   if (ride) {
-    const rate = F.carbRate(ride.duration_min, ride.if || 0, state.athlete);
+    const rate = F.carbRate(ride.duration_min, F.rideIntensity(ride, state.athlete), state.athlete);
     if (rate) {
       line(`<span><b>On the bike: ${rate.low}–${rate.high}g carbs/hr</b> over ${rate.hours.toFixed(1)}h — ${rate.total_low}–${rate.total_high}g total.</span>`);
       if (rate.needsBlend) line(`<span>⚠️ ${rate.blendNote}</span>`);
