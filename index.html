@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Fuel">
+<meta name="theme-color" content="#f8fafc">
+<meta name="robots" content="noindex, nofollow">
+<title>Fuel</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- Token gate: everything above this is public, nothing below it renders without a token -->
+<section id="gate" class="gate" hidden>
+  <div class="gate-card">
+    <h1>Fuel</h1>
+    <p class="muted">This page is code only. Your data lives in a private repo and needs a token to read.</p>
+    <label for="token-input">GitHub fine-grained token</label>
+    <input id="token-input" type="password" inputmode="text" autocomplete="off"
+           autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="github_pat_…">
+    <button id="token-save" class="btn-primary">Unlock</button>
+    <p id="token-error" class="error" hidden></p>
+    <details>
+      <summary>How to make one</summary>
+      <ol>
+        <li>github.com → Settings → Developer settings</li>
+        <li>Personal access tokens → Fine-grained tokens → Generate new token</li>
+        <li>Repository access → Only select repositories → <code>fuel-data</code></li>
+        <li>Permissions → Repository permissions → Contents → <strong>Read and write</strong></li>
+        <li>Generate, copy, paste above</li>
+      </ol>
+    </details>
+  </div>
+</section>
+
+<main id="app" hidden>
+
+  <header class="topbar">
+    <button id="day-prev" class="icon-btn" aria-label="Previous day">‹</button>
+    <div class="topbar-mid">
+      <h1 id="day-label">Today</h1>
+      <button id="day-today" class="link-btn" hidden>Back to today</button>
+    </div>
+    <button id="day-next" class="icon-btn" aria-label="Next day">›</button>
+  </header>
+
+  <div id="sync-bar" class="sync-bar" hidden></div>
+
+  <!-- ============ TODAY ============ -->
+  <section id="view-today" class="view">
+
+    <!-- The headline. Priority 1: cumulative deficit vs plan, week to date. -->
+    <div class="card hero">
+      <div class="hero-head">
+        <span class="hero-label">Week to date vs plan</span>
+        <span id="hero-week" class="muted small"></span>
+      </div>
+      <div id="hero-number" class="hero-number">—</div>
+      <div id="hero-sub" class="hero-sub muted"></div>
+      <div id="hero-bars" class="hero-bars"></div>
+      <div id="hero-detail" class="hero-detail"></div>
+    </div>
+
+    <div class="card">
+      <div class="row-between">
+        <h2>Today</h2>
+        <span id="day-badge" class="badge">—</span>
+      </div>
+      <div id="today-stats" class="stats"></div>
+      <div id="today-bars" class="bars"></div>
+      <div id="today-flags" class="flags"></div>
+    </div>
+
+    <div class="card">
+      <div class="row-between">
+        <h2>Meals</h2>
+        <button id="add-entry" class="btn-primary small">+ Log</button>
+      </div>
+      <div id="entries"></div>
+    </div>
+
+    <div class="card">
+      <h2>Fuel plan</h2>
+      <div id="fuel-plan"></div>
+    </div>
+
+    <div class="card">
+      <div class="row-between">
+        <h2>Confounders</h2>
+        <span class="muted small">tags this day on the trend</span>
+      </div>
+      <div id="confounders" class="chips"></div>
+    </div>
+  </section>
+
+  <!-- ============ TRENDS ============ -->
+  <section id="view-trends" class="view" hidden>
+    <div class="card">
+      <div class="row-between">
+        <h2>Weight</h2>
+        <span id="weight-rate" class="muted small"></span>
+      </div>
+      <div id="weight-chart" class="chart"></div>
+      <div id="weight-note" class="note" hidden></div>
+      <div class="row-between weigh-in">
+        <input id="weight-input" type="number" step="0.1" inputmode="decimal" placeholder="89.6">
+        <button id="weight-save" class="btn-primary small">Log weight</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Daily calories vs target</h2>
+      <div id="cal-chart" class="chart"></div>
+      <div id="cal-legend" class="legend"></div>
+    </div>
+
+    <div class="card">
+      <h2>Protein</h2>
+      <div id="protein-chart" class="chart"></div>
+    </div>
+
+    <div class="card">
+      <div class="row-between">
+        <h2>Last 14 days</h2>
+        <button id="toggle-table" class="link-btn">Table</button>
+      </div>
+      <div id="day-table" class="table-wrap" hidden></div>
+    </div>
+  </section>
+
+  <!-- ============ REFERENCE (kept from v1, unchanged) ============ -->
+  <section id="view-ref" class="view" hidden>
+    <div class="card">
+      <h2>50g carbs looks like</h2>
+      <ul class="ref">
+        <li>2 bananas <span>54g</span></li>
+        <li>1 large bagel <span>50g</span></li>
+        <li>750ml sports drink <span>45g</span></li>
+        <li>6 Clif Bloks <span>48g</span></li>
+        <li>2 slices Burgen rye + honey <span>48g</span></li>
+        <li>1 cup cooked rice <span>45g</span></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h2>10g protein looks like</h2>
+      <ul class="ref">
+        <li>1.5 eggs <span>10g</span></li>
+        <li>40ml WPI shake <span>10g</span></li>
+        <li>100g Greek yoghurt <span>10g</span></li>
+        <li>35g chicken breast <span>10g</span></li>
+        <li>40g tin tuna <span>10g</span></li>
+        <li>300ml milk <span>10g</span></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h2>Recovery snacks (50g carb + protein)</h2>
+      <ul class="ref">
+        <li>POST shake <span>34C / 28P</span></li>
+        <li>WPI shake + banana <span>29C / 26P</span></li>
+        <li>Greek yoghurt + honey + berries <span>20C / 21P</span></li>
+        <li>PB&amp;J on rye + WPI <span>42C / 41P</span></li>
+        <li>Chocolate milk 500ml <span>50C / 17P</span></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h2>Settings</h2>
+      <div id="settings"></div>
+    </div>
+  </section>
+
+  <nav class="tabbar">
+    <button class="tab active" data-view="today">Today</button>
+    <button class="tab" data-view="trends">Trends</button>
+    <button class="tab" data-view="ref">Reference</button>
+  </nav>
+</main>
+
+<!-- ============ LOG SHEET ============ -->
+<div id="sheet" class="sheet" hidden>
+  <div class="sheet-backdrop" data-close></div>
+  <div class="sheet-body">
+    <div class="sheet-head">
+      <button class="link-btn" data-close>Cancel</button>
+      <strong>Log</strong>
+      <input id="entry-time" type="time" step="60">
+    </div>
+
+    <div class="seg">
+      <button class="seg-btn active" data-tab="meals">Meals</button>
+      <button class="seg-btn" data-tab="singles">Items</button>
+      <button class="seg-btn" data-tab="custom">Custom</button>
+    </div>
+
+    <div id="sheet-meals" class="sheet-pane tile-grid"></div>
+    <div id="sheet-singles" class="sheet-pane list" hidden></div>
+
+    <div id="sheet-custom" class="sheet-pane" hidden>
+      <label for="c-label">What was it</label>
+      <input id="c-label" type="text" placeholder="Chicken burrito bowl">
+      <div class="macro-grid">
+        <div><label for="c-kcal">kcal</label><input id="c-kcal" type="number" inputmode="numeric"></div>
+        <div><label for="c-protein">P (g)</label><input id="c-protein" type="number" inputmode="numeric"></div>
+        <div><label for="c-carbs">C (g)</label><input id="c-carbs" type="number" inputmode="numeric"></div>
+        <div><label for="c-fat">F (g)</label><input id="c-fat" type="number" inputmode="numeric"></div>
+      </div>
+      <p class="muted small">Leave the macros blank if you don't know them. It saves as an unparsed note and Claude fills them in next time you're at the Mac.</p>
+      <button id="c-save" class="btn-primary">Add</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
