@@ -46,12 +46,30 @@ export async function verifyToken(token) {
   const res = await fetch(`${API}/repos/${OWNER}/${REPO}`, {
     headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' },
   });
-  if (res.status === 401) throw new Error('Token rejected. Check it was copied whole.');
-  if (res.status === 404) {
-    throw new Error(`Token is valid but cannot see ${OWNER}/${REPO}. Re-issue it with that repo selected and Contents: read and write.`);
+  if (res.ok) return true;
+
+  // Surface GitHub's own reason — a bare status code sends you hunting blind.
+  let detail = '';
+  try { detail = (await res.json())?.message || ''; } catch { /* body may be empty */ }
+
+  if (res.status === 401) {
+    throw new Error('Token rejected — check it pasted whole, with no trailing space, and has not expired.');
   }
-  if (!res.ok) throw new Error(`GitHub returned ${res.status}.`);
-  return true;
+  if (res.status === 404) {
+    throw new Error(`Token works but cannot see ${OWNER}/${REPO}. Re-issue it with that repo selected under "Only select repositories".`);
+  }
+  if (res.status === 403) {
+    if (res.headers.get('x-ratelimit-remaining') === '0') {
+      const reset = Number(res.headers.get('x-ratelimit-reset') || 0) * 1000;
+      throw new Error(`GitHub rate limit hit. Try again after ${new Date(reset).toLocaleTimeString()}.`);
+    }
+    throw new Error(
+      `GitHub refused the token (403). Usual cause: the token is missing "Metadata: Read-only", ` +
+      `which fine-grained tokens need on top of Contents. Check it is a fine-grained token, ` +
+      `scoped to ${REPO}, with Contents: Read and write.` + (detail ? ` GitHub said: ${detail}` : '')
+    );
+  }
+  throw new Error(`GitHub returned ${res.status}.` + (detail ? ` ${detail}` : ''));
 }
 
 // ---------- local cache ----------
@@ -209,6 +227,7 @@ export const paths = {
   templates: 'templates.json',
   workouts: 'sync/workouts.json',
   planned: 'sync/planned.json',
+  status: 'sync/status.json',
   day: (iso) => `log/${iso}.json`,
 };
 

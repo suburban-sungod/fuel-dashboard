@@ -9,7 +9,7 @@ const signed = (n) => (n == null ? '—' : (n >= 0 ? '+' : '−') + Math.abs(Mat
 
 const state = {
   athlete: null, weights: [], templates: { meals: [], singles: [] },
-  workouts: [], planned: [], logs: {},
+  workouts: [], planned: [], logs: {}, status: null,
   date: F.isoDate(new Date()), view: 'today', pendingTab: 'meals',
 };
 
@@ -51,14 +51,15 @@ function showGate() {
 }
 
 async function loadAll() {
-  const [athlete, weights, templates, workouts, planned] = await Promise.all([
+  const [athlete, weights, templates, workouts, planned, status] = await Promise.all([
     S.readJSON(S.paths.athlete),
     S.readJSON(S.paths.weight, []),
     S.readJSON(S.paths.templates, { meals: [], singles: [] }),
     S.readJSON(S.paths.workouts, []),
     S.readJSON(S.paths.planned, []),
+    S.readJSON(S.paths.status, null),
   ]);
-  Object.assign(state, { athlete, weights, templates, workouts, planned });
+  Object.assign(state, { athlete, weights, templates, workouts, planned, status });
   await loadDays(F.weekDates(state.date).concat(recentDates(21)));
 }
 
@@ -285,6 +286,18 @@ function renderFlags(t, tot) {
   const unparsed = today().entries.filter((e) => e.source === 'freetext');
   if (unparsed.length) {
     add('', `<b>${unparsed.length} unparsed ${unparsed.length === 1 ? 'entry' : 'entries'}.</b> Macros are missing until you run <code>/food-diary</code> at the Mac. Today's totals are understated.`);
+  }
+
+  // A sync that quietly died looks exactly like a rest week, so say so out loud.
+  const st = state.status;
+  if (st?.last_run) {
+    const ageDays = (Date.now() - new Date(st.last_run).getTime()) / 86400000;
+    if (ageDays > 2) {
+      add('warn', `<b>Training data is ${Math.floor(ageDays)} days stale.</b> The Mac sync last ran ${new Date(st.last_run).toLocaleDateString()}. Day types and ride calories below that date are missing, not zero.`);
+    } else if (st.strava_ok === false || st.trainingpeaks_ok === false) {
+      const dead = [st.strava_ok === false && 'Strava', st.trainingpeaks_ok === false && 'TrainingPeaks'].filter(Boolean).join(' and ');
+      add('warn', `<b>${dead} failed on the last sync.</b> Ride calories may be understated, which makes the deficit look bigger than it is.`);
+    }
   }
 
   if (t.activity_confidence === 'estimated' && t.activity_kcal) {
