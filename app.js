@@ -9,7 +9,7 @@ const signed = (n) => (n == null ? '—' : (n >= 0 ? '+' : '−') + Math.abs(Mat
 
 const state = {
   athlete: null, weights: [], templates: { meals: [], singles: [] },
-  workouts: [], planned: [], logs: {}, status: null,
+  workouts: [], planned: [], logs: {}, months: {}, status: null,
   date: F.isoDate(new Date()), view: 'today', pendingTab: 'meals',
 };
 
@@ -60,7 +60,7 @@ async function loadAll() {
     S.readJSON(S.paths.status, null),
   ]);
   Object.assign(state, { athlete, weights, templates, workouts, planned, status });
-  await loadDays(F.weekDates(state.date).concat(recentDates(21)));
+  await loadMonths(F.weekDates(state.date).concat(recentDates(21)));
 }
 
 function recentDates(n) {
@@ -69,18 +69,30 @@ function recentDates(n) {
   return out;
 }
 
-async function loadDays(dates) {
-  const uniq = [...new Set(dates)];
-  await Promise.all(uniq.map(async (d) => {
-    if (state.logs[d]) return;
-    state.logs[d] = (await S.readJSON(S.paths.day(d), null)) || { date: d, entries: [], confounders: [], notes: '' };
-  }));
+/**
+ * Load whole months and unpack them into per-day state. Sequential on purpose: three
+ * requests in a row is well inside GitHub's burst allowance, where a fan-out of one
+ * request per day was not.
+ */
+async function loadMonths(dates) {
+  const months = [...new Set(dates.map((d) => d.slice(0, 7)))];
+  for (const m of months) {
+    if (state.months[m]) continue;
+    const file = (await S.readJSON(S.paths.month(m + '-01'), null)) || { month: m, days: {} };
+    state.months[m] = file;
+    for (const [date, day] of Object.entries(file.days || {})) {
+      state.logs[date] = { date, entries: [], confounders: [], notes: '', ...day };
+    }
+  }
+  for (const d of new Set(dates)) {
+    if (!state.logs[d]) state.logs[d] = { date: d, entries: [], confounders: [], notes: '' };
+  }
 }
 
 async function flush() {
   const before = S.pendingCount();
   if (before) {
-    const { flushed } = await S.flushQueue(S.mergeDay);
+    const { flushed } = await S.flushQueue(S.mergeMonth);
     if (flushed) renderSyncBar();
   }
   renderSyncBar();
@@ -94,7 +106,12 @@ function today() { return state.logs[state.date] || { date: state.date, entries:
 
 function saveDay(day) {
   state.logs[day.date] = day;
-  S.queueWrite(S.paths.day(day.date), day, `log: ${day.date}`);
+  const key = day.date.slice(0, 7);
+  const month = state.months[key] || { month: key, days: {} };
+  const { date, ...rest } = day;
+  month.days = { ...month.days, [day.date]: rest };
+  state.months[key] = month;
+  S.queueWrite(S.paths.month(day.date), month, `log: ${day.date}`);
   render();
   flush();
 }
@@ -102,8 +119,8 @@ function saveDay(day) {
 // ============ wiring ============
 
 function wire() {
-  $('#day-prev').onclick = async () => { state.date = F.addDays(state.date, -1); await loadDays([state.date]); render(); };
-  $('#day-next').onclick = async () => { state.date = F.addDays(state.date, 1); await loadDays([state.date]); render(); };
+  $('#day-prev').onclick = async () => { state.date = F.addDays(state.date, -1); await loadMonths([state.date]); render(); };
+  $('#day-next').onclick = async () => { state.date = F.addDays(state.date, 1); await loadMonths([state.date]); render(); };
   $('#day-today').onclick = () => { state.date = F.isoDate(new Date()); render(); };
 
   $$('.tab').forEach((b) => b.onclick = () => { state.view = b.dataset.view; render(); });

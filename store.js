@@ -228,18 +228,30 @@ export const paths = {
   workouts: 'sync/workouts.json',
   planned: 'sync/planned.json',
   status: 'sync/status.json',
-  day: (iso) => `log/${iso}.json`,
+  // One file per MONTH, not per day. Per-day files meant ~27 concurrent API calls on every
+  // open, which trips GitHub's secondary (burst) rate limit and returns 403. A month per
+  // file makes a full load 8 requests regardless of how long the log runs.
+  month: (iso) => `log/${iso.slice(0, 7)}.json`,
 };
 
-/** Merge rule for day files: union of entries by id, remote confounders lose to local. */
-export function mergeDay(path, remote, local) {
+/**
+ * Merge rule for month files: union days, and within a shared day union entries by id.
+ * Lets the phone and the desktop both write the same month without either losing work.
+ */
+export function mergeMonth(path, remote, local) {
   if (!path.startsWith('log/')) return local;
-  const byId = new Map();
-  for (const e of remote?.entries || []) byId.set(e.id, e);
-  for (const e of local?.entries || []) byId.set(e.id, e);
-  return {
-    ...remote,
-    ...local,
-    entries: [...byId.values()].sort((a, b) => (a.time || '').localeCompare(b.time || '')),
-  };
+  const days = { ...(remote?.days || {}) };
+  for (const [date, localDay] of Object.entries(local?.days || {})) {
+    const remoteDay = days[date];
+    if (!remoteDay) { days[date] = localDay; continue; }
+    const byId = new Map();
+    for (const e of remoteDay.entries || []) byId.set(e.id, e);
+    for (const e of localDay.entries || []) byId.set(e.id, e);
+    days[date] = {
+      ...remoteDay,
+      ...localDay,
+      entries: [...byId.values()].sort((a, b) => (a.time || '').localeCompare(b.time || '')),
+    };
+  }
+  return { ...remote, ...local, days };
 }
