@@ -205,6 +205,7 @@ function wire() {
   $('#c-save').onclick = addCustom;
   $('#add-entry').onclick = () => openSheet();
   $('#add-entry-bottom').onclick = () => openSheet();
+  $('#sync-now').onclick = syncNow;
   $('#weight-save-today').onclick = logWeight;
 }
 
@@ -279,6 +280,54 @@ function timeAgo(ms) {
   if (s < 3600) return `${Math.round(s / 60)} min ago`;
   if (s < 86400) return `${Math.round(s / 3600)}h ago`;
   return `${Math.round(s / 86400)}d ago`;
+}
+
+// ---------- sync now ----------
+//
+// The hourly Mac job is fine for yesterday's rides and useless for the one he just
+// finished. This pulls TrainingPeaks through the Worker and writes the two sync files
+// itself, so a ride shows up in the day type and the deficit within a few seconds of
+// being uploaded rather than at the top of the next hour.
+
+async function syncNow() {
+  const btn = $('#sync-now');
+  const out = $('#sync-now-status');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  out.hidden = false;
+  out.textContent = 'Asking TrainingPeaks…';
+
+  const res = await S.syncTraining();
+  if (res.error) {
+    // Says which failure it was, because the fixes are unrelated: an expired cookie needs
+    // a new secret at the Mac, a timeout needs nothing but patience.
+    out.textContent = `${res.error} The hourly Mac sync is unaffected.`;
+    btn.disabled = false;
+    return;
+  }
+
+  state.workouts = res.workouts;
+  state.planned = res.planned;
+  S.queueWrite(S.paths.workouts, res.workouts, 'sync: workouts (from the app)');
+  S.queueWrite(S.paths.planned, res.planned, 'sync: planned (from the app)');
+  // The staleness warning reads this. Without updating it, a successful sync leaves the
+  // app still insisting the training data is days old.
+  state.status = {
+    ...(state.status || {}),
+    last_run: new Date().toISOString(),
+    workouts: res.workouts.length,
+    planned: res.planned.length,
+    trainingpeaks_ok: true,
+    source: 'app',
+  };
+  S.queueWrite(S.paths.status, state.status, 'sync: status (from the app)');
+
+  const done = res.workouts.filter((w) => w.date === F.isoDate(new Date())).length;
+  out.textContent = `${res.workouts.length} workouts, ${res.planned.length} planned`
+    + (done ? ` · ${done} logged today` : ' · nothing recorded today yet');
+  btn.disabled = false;
+  render();
+  flush();
 }
 
 // ---------- closing the day ----------
@@ -456,10 +505,9 @@ function renderFlags(t, tot) {
   if (st?.last_run) {
     const ageDays = (Date.now() - new Date(st.last_run).getTime()) / 86400000;
     if (ageDays > 2) {
-      add('warn', `<b>Training data is ${Math.floor(ageDays)} days stale.</b> The Mac sync last ran ${new Date(st.last_run).toLocaleDateString()}. Day types and ride calories below that date are missing, not zero.`);
-    } else if (st.strava_ok === false || st.trainingpeaks_ok === false) {
-      const dead = [st.strava_ok === false && 'Strava', st.trainingpeaks_ok === false && 'TrainingPeaks'].filter(Boolean).join(' and ');
-      add('warn', `<b>${dead} failed on the last sync.</b> Ride calories may be understated, which makes the deficit look bigger than it is.`);
+      add('warn', `<b>Training data is ${Math.floor(ageDays)} days stale.</b> The last sync was ${new Date(st.last_run).toLocaleDateString()}. Day types and ride calories below that date are missing, not zero. Sync TrainingPeaks from the fuel plan below.`);
+    } else if (st.trainingpeaks_ok === false) {
+      add('warn', `<b>TrainingPeaks failed on the last sync.</b> Ride calories may be understated, which makes the deficit look bigger than it is.`);
     }
   }
 

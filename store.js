@@ -211,6 +211,50 @@ export async function parseText(entries, timeoutMs = PARSE_TIMEOUT_MS) {
   }
 }
 
+/**
+ * Pull training data from TrainingPeaks, now, through the Worker.
+ *
+ * `sync.py` runs hourly on the Mac and cannot be reached from a page on GitHub Pages, so
+ * "sync now" used to be impossible: an hour-old plan was an hour-old plan. TrainingPeaks
+ * the Worker can reach directly, and it carries everything the app reads off a workout.
+ *
+ * Returns `{ workouts, planned }` on success, or `{ error }` — this one reports its
+ * failure rather than degrading silently, because the whole point is that he pressed a
+ * button and is waiting to see whether it worked.
+ */
+export async function syncTraining(timeoutMs = 30000) {
+  const url = parseUrl().replace(/\/parse$/, '/sync');
+  const token = getToken();
+  if (!url || !token) return { error: 'no sync endpoint configured' };
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      signal: ctrl.signal,
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      dbg(`sync: HTTP ${res.status} (${body.error || 'no reason given'})`);
+      return { error: body.error || `sync failed (${res.status})` };
+    }
+    if (!Array.isArray(body.workouts) || !Array.isArray(body.planned)) {
+      dbg('sync: response was the wrong shape');
+      return { error: 'TrainingPeaks returned nothing usable' };
+    }
+    dbg(`sync: ${body.workouts.length} workouts, ${body.planned.length} planned`);
+    return { workouts: body.workouts, planned: body.planned };
+  } catch (e) {
+    const reason = e?.name === 'AbortError' ? 'timed out' : e?.message || 'failed';
+    dbg(`sync: ${reason}`);
+    return { error: `Could not reach the sync service — ${reason}.` };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ---------- local cache ----------
 
 function cacheGet(path) {
