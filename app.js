@@ -165,7 +165,13 @@ function ctx() {
 
 function today() { return state.logs[state.date] || { date: state.date, entries: [], confounders: [] }; }
 
-async function saveDay(day) {
+/**
+ * Persist a day. `commit: false` updates state and the screen but queues nothing —
+ * used for the second or two while a free-text entry is being estimated synchronously.
+ * Writing a `pending` entry to GitHub in that window would fire the parse Action and
+ * re-create the out-of-band race the Worker exists to remove.
+ */
+async function saveDay(day, { commit = true } = {}) {
   const key = day.date.slice(0, 7);
   // Never write a month file this device has not read. Building one from scratch queues a
   // file holding a single day, and only the conflict handler stops that flattening the
@@ -177,6 +183,7 @@ async function saveDay(day) {
   const { date, ...rest } = day;
   month.days = { ...month.days, [day.date]: rest };
   state.months[key] = month;
+  if (!commit) { render(); return; }
   S.queueWrite(S.paths.month(day.date), month, `log: ${day.date}`);
   render();
   flush();
@@ -987,7 +994,26 @@ function addEntry(item, source) {
   closeSheet();
 }
 
-function addCustom() {
+/**
+ * Fold a synchronous estimate into the entry it was made for. Mirrors `apply()` in
+ * parse.py — same fields, same precedence — so an entry looks identical whichever path
+ * resolved it. Returns null if the estimate is not usable, which sends it to the fallback.
+ */
+function applyEstimate(entry, r) {
+  const n = (v) => (typeof v === 'number' && isFinite(v) ? v : null);
+  if (!r || n(r.kcal) == null || n(r.protein) == null || n(r.carbs) == null || n(r.fat) == null) return null;
+  const { parse_state, parse_error, parse_attempts, logged_at, ...rest } = entry;
+  return {
+    ...rest,
+    label: r.label || entry.label,
+    kcal: r.kcal, protein: r.protein, carbs: r.carbs, fat: r.fat,
+    source: 'parsed',
+    confidence: r.confidence || 'medium',
+    note: r.assumption || '',
+  };
+}
+
+async function addCustom() {
   const label = $('#c-label').value.trim();
   if (!label) return;
   const kcal = Number($('#c-kcal').value) || 0;
@@ -1022,11 +1048,41 @@ function addCustom() {
   // Editing replaces in place and keeps the id, so the parser and the merge both still
   // recognise it as the same entry rather than resurrecting the old one alongside it.
   const rest = editingId ? day.entries.filter((x) => x.id !== editingId) : day.entries;
-  saveDay({ ...day, entries: [...rest, entry].sort((a, b) => a.time.localeCompare(b.time)) });
+  const withEntry = (e) => [...rest, e].sort((a, b) => a.time.localeCompare(b.time));
 
   ['#c-label', '#c-kcal', '#c-protein', '#c-carbs', '#c-fat'].forEach((s) => ($(s).value = ''));
   closeSheet();
-  if (entry.source === 'freetext') { S.dbg(`freetext entry ${entry.id} queued for parse`); watchForParse(); }
+
+  if (entry.source !== 'freetext') {
+    await saveDay({ ...day, entries: withEntry(entry) });
+    return;
+  }
+
+  // Free text: try to resolve it here and now, and commit once, already parsed.
+  //
+  // The row goes on screen immediately so the tap feels instant, but nothing is queued for
+  // GitHub until the estimate lands. Cost of that: an entry logged and then killed inside
+  // the ~2 second window is lost. It is also never half-written, which the alternative
+  // (queue now, rewrite later) cannot promise — and that half-written state, discovered by
+  // polling, is the bug this whole change exists to delete.
+  await saveDay({ ...day, entries: withEntry(entry) }, { commit: false });
+
+  const results = await S.parseText([{ id, date: day.date, time, text: label }]);
+  const resolved = applyEstimate(entry, results?.find((r) => r.id === id));
+
+  // Re-read the day: a refresh or another edit may have moved underneath us while waiting.
+  const current = state.logs[day.date] || { ...day, entries: withEntry(entry) };
+  const entries = (current.entries || []).map((e) => (e.id === id ? (resolved || entry) : e));
+  await saveDay({ ...current, date: day.date, entries });
+
+  if (resolved) {
+    S.dbg(`entry ${id} parsed synchronously (${resolved.kcal} kcal, ${resolved.confidence})`);
+  } else {
+    // Committed as pending, exactly as before the Worker existed: the push fires
+    // parse.yml, and the watcher picks the result up.
+    S.dbg(`entry ${id} fell back to the async parser`);
+    watchForParse();
+  }
 }
 
 // ---------- waiting on the parser ----------

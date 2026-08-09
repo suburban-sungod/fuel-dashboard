@@ -12,6 +12,7 @@ const LS = {
   queue: 'fuel.queue',
   lastSync: 'fuel.lastSync',
   debug: 'fuel.debug',
+  parseUrl: 'fuel.parseUrl',
 };
 
 // ---------- diagnostics ----------
@@ -123,6 +124,91 @@ export async function verifyToken(token) {
     );
   }
   throw new Error(`GitHub returned ${res.status}.` + (detail ? ` ${detail}` : ''));
+}
+
+// ---------- synchronous parsing ----------
+//
+// The Worker (source in the private fuel-data repo, `worker/`) estimates macros in the
+// HTTP response, so an entry can be written to GitHub once, already resolved. That deletes
+// the entire "client must discover an out-of-band mutation" problem — the GitHub Action
+// rewriting entries in place, and the client polling to notice, is what failed four
+// separate ways in one day.
+//
+// The Action path is still there and still correct. Every failure here — a bad response, a
+// timeout, no signal, no configured URL — falls back to it. Nothing in this file is a
+// secret: the endpoint is public and useless without the GitHub token the caller presents.
+
+const PARSE_URL = 'https://fuel-parse.shadesofjade.workers.dev/parse';
+const PARSE_TIMEOUT_MS = 10000;
+
+/**
+ * The parse endpoint, or '' if there isn't one. The localStorage override exists so the
+ * fallback path can be exercised for real — point it at a dead host and log something —
+ * without deleting the Worker.
+ */
+export function parseUrl() {
+  const override = localStorage.getItem(LS.parseUrl);
+  if (override != null) return override.trim();
+  return PARSE_URL.includes('__SUBDOMAIN__') ? '' : PARSE_URL;
+}
+
+export function setParseUrl(url) {
+  if (url == null) localStorage.removeItem(LS.parseUrl);
+  else localStorage.setItem(LS.parseUrl, String(url).trim());
+}
+
+/**
+ * Estimate macros for free-text entries, synchronously.
+ *
+ * Returns an array of results, or **null** meaning "this did not work, use the async
+ * path". Never throws and never rejects: the caller's fallback is the whole safety net,
+ * so a thrown error here would be an outage rather than a degradation.
+ */
+export async function parseText(entries, timeoutMs = PARSE_TIMEOUT_MS) {
+  const url = parseUrl();
+  const token = getToken();
+  if (!url || !token || !entries?.length) {
+    dbg(`parse: skipped (${!url ? 'no endpoint' : !token ? 'no token' : 'nothing to parse'})`);
+    return null;
+  }
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    dbg('parse: offline, falling back to the async parser');
+    return null;
+  }
+
+  const started = Date.now();
+  // AbortSignal.timeout is not in older iOS Safari, and this runs on a phone. A manual
+  // controller is two more lines and works everywhere.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entries }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) {
+      let why = '';
+      try { why = (await res.json())?.error || ''; } catch { /* body may be empty */ }
+      dbg(`parse: HTTP ${res.status}${why ? ` (${why})` : ''} after ${Date.now() - started}ms, falling back`);
+      return null;
+    }
+    const out = (await res.json())?.entries;
+    if (!Array.isArray(out) || !out.length) {
+      dbg('parse: response had no estimates, falling back');
+      return null;
+    }
+    dbg(`parse: resolved ${out.length} in ${Date.now() - started}ms`);
+    return out;
+  } catch (e) {
+    const reason = e?.name === 'AbortError' ? `timed out after ${timeoutMs}ms` : e?.message || 'failed';
+    dbg(`parse: ${reason}, falling back to the async parser`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ---------- local cache ----------
