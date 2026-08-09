@@ -51,6 +51,10 @@ async function boot() {
   document.addEventListener('visibilitychange', () => { if (!document.hidden) resume(); });
   window.addEventListener('focus', resume);
 
+  // A desktop tab can sit focused for hours without a single visibilitychange, so focus
+  // alone is not enough — poll gently while the window is actually being looked at.
+  setInterval(() => { if (!document.hidden) refreshData(); }, 5 * 60 * 1000);
+
   // Midnight crossed with the app still open otherwise leaves it logging into yesterday.
   // Only follow the clock if he was actually sitting on today; never yank him off a day
   // he deliberately paged back to.
@@ -226,8 +230,16 @@ function renderSyncBar() {
     const t = S.lastSync();
     bar.hidden = !t;
     bar.className = 'sync-bar';
-    if (t) bar.textContent = `Synced ${timeAgo(t)}`;
+    if (t) bar.textContent = `Synced ${timeAgo(t)} · tap to refresh`;
   }
+  // Always give him a way to force a read. Waiting on a timer to prove the app is not
+  // broken is a bad place to leave someone who has just watched an entry not appear.
+  bar.onclick = async () => {
+    bar.textContent = 'Checking GitHub…';
+    const changed = await refreshData({ force: true });
+    if (!changed) { bar.textContent = 'Up to date'; setTimeout(renderSyncBar, 1500); }
+  };
+  bar.style.cursor = 'pointer';
 }
 
 function timeAgo(ms) {
@@ -951,13 +963,65 @@ async function parseTick() {
   if (Date.now() < parseDeadline) reschedule();
 }
 
+// ---------- staying current with the repo ----------
+//
+// The app used to read the log exactly once, at boot, and never again. A desktop tab left
+// open all day therefore showed a snapshot from whenever it was opened: entries logged on
+// the phone simply never appeared, and it looked like the phone had failed to save them.
+// Worse, writing from that stale tab pushed a month file missing everything the phone had
+// added, and only the conflict merge stopped it being a real data loss.
+//
+// Refresh is deliberately narrow — the log and the weight log, the two things that change
+// from another device. The profile, templates and sync files change rarely and are not
+// worth spending a request on every time a window regains focus.
+
+const REFRESH_MIN_GAP_MS = 60000;
+let lastRefresh = 0;
+
+async function refreshData({ force = false } = {}) {
+  if (!force && Date.now() - lastRefresh < REFRESH_MIN_GAP_MS) return false;
+  // Never read over the top of a write that has not been sent yet.
+  if (S.pendingCount()) return false;
+  lastRefresh = Date.now();
+
+  const monthKeys = new Set([state.date.slice(0, 7), F.isoDate(new Date()).slice(0, 7)]);
+  let changed = false;
+
+  for (const m of monthKeys) {
+    const path = S.paths.month(m + '-01');
+    let got;
+    try { got = await S.peekJSON(path); } catch { continue; }
+    if (!got || S.pendingCount()) continue;      // a write landed mid-fetch — leave it alone
+    if (JSON.stringify(state.months[m]) === JSON.stringify(got.value)) continue;
+    S.adopt(path, got.value, got.sha);
+    state.months[m] = got.value;
+    for (const [d, day] of Object.entries(got.value.days || {})) {
+      state.logs[d] = { date: d, entries: [], confounders: [], notes: '', ...day };
+    }
+    changed = true;
+  }
+
+  try {
+    const w = await S.peekJSON(S.paths.weight);
+    if (w && !S.pendingCount() && JSON.stringify(w.value) !== JSON.stringify(state.weights)) {
+      S.adopt(S.paths.weight, w.value, w.sha);
+      state.weights = w.value;
+      changed = true;
+    }
+  } catch { /* the log matters more; a stale weight is visible in the UI anyway */ }
+
+  if (changed) render();
+  return changed;
+}
+
 /**
  * Called when the app comes back to the foreground. Flushes anything the suspended timer
- * failed to send, then reopens the parse window — the entries waiting on it have just had
- * their best chance to land while the screen was off.
+ * failed to send, pulls in whatever another device logged while this one was away, then
+ * reopens the parse window.
  */
 async function resume() {
   await flush();
+  await refreshData();
   watchForParse(true);
 }
 
