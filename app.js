@@ -206,7 +206,7 @@ function render() {
   ['today', 'trends', 'ref'].forEach((v) => { $('#view-' + v).hidden = state.view !== v; });
   $$('.tab').forEach((b) => b.classList.toggle('active', b.dataset.view === state.view));
 
-  if (state.view === 'today') { renderHero(); renderToday(); renderEntries(); renderPlan(); renderConfounders(); }
+  if (state.view === 'today') { renderHero(); renderToday(); renderEntries(); renderSuggestions(); renderPlan(); renderConfounders(); }
   if (state.view === 'trends') { renderWeight(); renderCalChart(); renderProteinChart(); renderTable(); }
   if (state.view === 'ref') renderSettings();
   renderSyncBar();
@@ -465,6 +465,67 @@ function renderEntries() {
 }
 
 function escapeHtml(s) { return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+
+// ---------- what should I eat ----------
+
+function renderSuggestions() {
+  const box = $('#suggestions');
+  box.innerHTML = '';
+  const t = F.targetsFor(state.date, ctx());
+  const tot = F.dayTotals(today().entries);
+
+  if (t.kcal_target == null) {
+    $('#suggest-headline').textContent = 'Needs a weigh-in before it can suggest anything.';
+    $('#suggest-mode').textContent = '';
+    return;
+  }
+
+  const now = new Date();
+  const s = F.suggestSnacks({
+    targets: t, totals: tot, entries: today().entries, templates: state.templates,
+    workouts: t.workouts, planned: t.planned,
+    nowMin: now.getHours() * 60 + now.getMinutes(),
+  });
+
+  $('#suggest-mode').textContent = { over: 'over target', recovery: 'recovery window',
+    prefuel: 'pre-ride', 'protein-tight': 'protein, tight', protein: 'protein',
+    topup: 'top up' }[s.mode] || '';
+  $('#suggest-headline').textContent = s.headline;
+
+  if (!s.picks.length) {
+    box.appendChild(el('p', 'muted small', 'Nothing in your usual foods fits what is left. Log something custom.'));
+    return;
+  }
+
+  for (const p of s.picks) {
+    const row = el('button', 'suggestion' + (p.repeated ? ' repeated' : ''));
+    row.innerHTML = `<div class="s-main">
+        <div class="s-label">${escapeHtml(p.label)}${p.repeated ? ' <em class="tag">again</em>' : ''}${p.source === 'estimate' ? ' <em class="tag">est</em>' : ''}</div>
+        <div class="s-why">${escapeHtml(p.why)}</div>
+      </div>
+      <div class="s-macros"><b>${num(p.kcal)}</b><span>${Math.round(p.protein)}P · ${Math.round(p.carbs)}C</span></div>`;
+    // Suggest then log in one tap. A suggestion you have to go and re-enter by hand is
+    // just advice, and advice is the part he already has.
+    row.onclick = () => logSuggestion(p);
+    box.appendChild(row);
+  }
+}
+
+/** Log a suggestion straight in — as its component items if it was a pair. */
+function logSuggestion(pick) {
+  const now = new Date();
+  const time = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  const parts = pick.parts || [pick];
+  const day = today();
+  const added = parts.map((item, i) => ({
+    id: Math.random().toString(36).slice(2, 8) + i,
+    time,
+    label: item.label,
+    kcal: item.kcal, protein: item.protein, carbs: item.carbs, fat: item.fat,
+    source: 'template', note: item.detail || '',
+  }));
+  saveDay({ ...day, entries: [...day.entries, ...added].sort((a, b) => a.time.localeCompare(b.time)) });
+}
 
 // ---------- fuel plan ----------
 

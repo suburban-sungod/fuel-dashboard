@@ -471,6 +471,200 @@ export function carbRate(durationMin, intensityFactor, athlete) {
   };
 }
 
+// ---------- what should I eat now ----------
+//
+// Suggests from Matt's OWN food list, never from a generic database. The value is not
+// "here is a snack", it is "here is a snack you already eat, that closes the gap you
+// actually have right now, and here is why". A suggestion he would not eat is noise.
+//
+// The gap that matters is almost never calories. It is protein: he lands the calorie
+// target routinely and finishes days 60-100g short on protein, so the default mode ranks
+// on protein per calorie rather than on filling the remaining budget.
+
+export const RECOVERY_WINDOW_MIN = 90;
+export const PREFUEL_WINDOW_MIN = 180;
+
+/** Items worth offering: real food, macros known, not a condiment or a drink. */
+function snackable(templates) {
+  const ok = (i) => i.suggest !== false && (i.kcal || 0) >= 25;
+  return {
+    singles: (templates.singles || []).filter(ok),
+    meals: (templates.meals || []).filter(ok),
+  };
+}
+
+const density = (v, kcal) => (kcal > 0 ? (v / kcal) * 100 : 0);
+
+/**
+ * Sensible two-item combinations only: something protein-dominant with something
+ * carb-dominant. Pairing two steaks, or two bananas, is not advice.
+ */
+function pairsOf(singles) {
+  const protein = singles.filter((i) => density(i.protein, i.kcal) >= 8);
+  const carb = singles.filter((i) => density(i.carbs, i.kcal) >= 15);
+  const out = [];
+  for (const p of protein) {
+    for (const c of carb) {
+      if (p.id === c.id) continue;
+      out.push({
+        id: `${p.id}+${c.id}`,
+        label: `${p.label} + ${c.label}`,
+        kcal: p.kcal + c.kcal,
+        protein: p.protein + c.protein,
+        carbs: p.carbs + c.carbs,
+        fat: p.fat + c.fat,
+        source: p.source === 'estimate' || c.source === 'estimate' ? 'estimate' : 'known',
+        parts: [p, c],
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Work out what the moment calls for. Recovery and pre-fuel beat the daily arithmetic:
+ * an hour after a three-hour ride, protein-per-calorie is the wrong question.
+ */
+export function suggestionMode({ targets, totals, workouts, planned, nowMin }) {
+  const kcalLeft = targets.kcal_target == null ? null : targets.kcal_target - totals.kcal;
+  const proteinLeft = targets.protein_target == null ? 0 : Math.max(0, targets.protein_target - totals.protein);
+
+  if (kcalLeft != null && kcalLeft <= 0) return { mode: 'over', kcalLeft, proteinLeft };
+
+  const ended = (w) => {
+    const start = minutesOf(w.start_time);
+    return start == null ? null : start + (w.duration_min || 0);
+  };
+  const justFinished = (workouts || []).some((w) => {
+    const e = ended(w);
+    return e != null && nowMin >= e && nowMin - e <= RECOVERY_WINDOW_MIN;
+  });
+  if (justFinished) return { mode: 'recovery', kcalLeft, proteinLeft };
+
+  const soon = (planned || []).some((p) => {
+    if (NON_FUELLED.has(p.type)) return false;
+    const s = minutesOf(p.start_time);
+    return s != null && s > nowMin && s - nowMin <= PREFUEL_WINDOW_MIN;
+  });
+  if (soon) return { mode: 'prefuel', kcalLeft, proteinLeft };
+
+  // Can the protein gap still be closed inside the calories left? If it comfortably can,
+  // this is an ordinary top-up. If it cannot, protein has to drive every remaining choice.
+  const needed = proteinLeft > 0 && kcalLeft != null ? density(proteinLeft, kcalLeft) : 0;
+  if (proteinLeft >= 20) return { mode: needed >= 12 ? 'protein-tight' : 'protein', kcalLeft, proteinLeft };
+  return { mode: 'topup', kcalLeft, proteinLeft };
+}
+
+function scoreFor(mode, c, { kcalLeft, proteinLeft }) {
+  const pDens = density(c.protein, c.kcal);
+  const cDens = density(c.carbs, c.kcal);
+  const fDens = density(c.fat, c.kcal);
+
+  switch (mode) {
+    case 'recovery': {
+      // 30-40g protein with carbs alongside. Reward landing in the band, not exceeding it.
+      const inBand = 1 - Math.min(1, Math.abs(c.protein - 35) / 35);
+      return 60 * inBand + 30 * Math.min(1, c.carbs / 40) - 10 * Math.min(1, fDens / 40);
+    }
+    case 'prefuel':
+      // Absolute carbs first, density second. Ranking on density alone recommended a
+      // single Clif Blok before a 75-minute tempo session: the densest carb he owns, and
+      // 8g of the 80-120g he actually needs. Fat is penalised twice, as a share and as a
+      // total, because fat before a ride is how you end up with gut trouble.
+      return 65 * Math.min(1, c.carbs / 70)
+           + 20 * Math.min(1, cDens / 50)
+           - 30 * Math.min(1, fDens / 35)
+           - 15 * Math.min(1, Math.max(0, c.fat - 12) / 20);
+    case 'protein-tight':
+      // Every calorie has to work. Density dominates; volume barely counts.
+      return 85 * Math.min(1, pDens / 25) + 15 * Math.min(1, c.protein / Math.max(1, proteinLeft));
+    case 'protein':
+      return 55 * Math.min(1, pDens / 25) + 45 * Math.min(1, c.protein / Math.max(1, proteinLeft));
+    default:
+      // Topup: protein still counts, but so does actually filling the remaining budget.
+      return 40 * Math.min(1, pDens / 20) + 40 * Math.min(1, c.kcal / Math.max(1, kcalLeft)) - 15 * Math.min(1, fDens / 45);
+  }
+}
+
+function reasonFor(mode, c, { proteinLeft, kcalLeft }) {
+  const after = kcalLeft == null ? null : kcalLeft - c.kcal;
+  const tail = after == null ? '' : ` Leaves ${Math.round(after)} kcal.`;
+  switch (mode) {
+    case 'recovery':
+      return `${Math.round(c.protein)}g protein and ${Math.round(c.carbs)}g carbs inside the recovery window.${tail}`;
+    case 'prefuel':
+      // Don't call 20g of fat "only" 20g. Overselling a pick is how the feature stops
+      // being trusted.
+      return c.fat <= 10
+        ? `${Math.round(c.carbs)}g carbs and only ${Math.round(c.fat)}g fat — sits well before a ride.${tail}`
+        : `${Math.round(c.carbs)}g carbs. ${Math.round(c.fat)}g fat, so give it a bit of time.${tail}`;
+    case 'protein-tight':
+      return `${Math.round(density(c.protein, c.kcal))}g protein per 100 kcal, the best ratio you have left.${tail}`;
+    case 'protein':
+      return `${Math.round(c.protein)}g of the ${Math.round(proteinLeft)}g protein you still need.${tail}`;
+    default:
+      return `${Math.round(c.kcal)} kcal, ${Math.round(c.protein)}g protein.${tail}`;
+  }
+}
+
+const HEADLINE = {
+  over: (s) => `You're ${Math.abs(Math.round(s.kcalLeft))} kcal over target. Nothing more today unless it's protein.`,
+  recovery: () => `You finished a session in the last ${RECOVERY_WINDOW_MIN} minutes. Protein and carbs now.`,
+  prefuel: () => `Ride coming up. Carbs, and go easy on the fat.`,
+  'protein-tight': (s) => `${Math.round(s.proteinLeft)}g protein left in only ${Math.round(s.kcalLeft)} kcal. Every choice has to be dense.`,
+  protein: (s) => `${Math.round(s.proteinLeft)}g protein still to find, ${Math.round(s.kcalLeft)} kcal to play with.`,
+  topup: (s) => `Protein's basically there. ${Math.round(s.kcalLeft)} kcal left if you want it.`,
+};
+
+/**
+ * Rank Matt's own foods against the gap he has right now.
+ *
+ * `nowMin` is minutes since midnight, passed in rather than read from the clock so this
+ * stays pure and testable.
+ */
+export function suggestSnacks({ targets, totals, entries, templates, workouts, planned, nowMin, limit = 3 }) {
+  const situation = suggestionMode({ targets, totals, workouts, planned, nowMin });
+  const { mode, kcalLeft, proteinLeft } = situation;
+  const out = { ...situation, headline: HEADLINE[mode](situation), picks: [] };
+
+  const { singles, meals } = snackable(templates || {});
+  let candidates = [...singles, ...meals, ...pairsOf(singles)];
+
+  // Over budget: only protein-dense items are still defensible, and say so.
+  if (mode === 'over') {
+    candidates = candidates.filter((c) => density(c.protein, c.kcal) >= 15 && c.kcal <= 200);
+  } else if (kcalLeft != null) {
+    candidates = candidates.filter((c) => c.kcal <= kcalLeft * 1.05);
+  }
+
+  const eatenToday = new Set((entries || []).map((e) => (e.label || '').toLowerCase()));
+  const seen = new Set();
+
+  out.picks = candidates
+    .map((c) => {
+      let score = scoreFor(mode, c, { kcalLeft, proteinLeft });
+      // Already had it today: still allowed, just not the headline advice.
+      const repeated = [...(c.parts || [c])].some((p) => eatenToday.has((p.label || '').toLowerCase()));
+      if (repeated) score *= 0.6;
+      if (c.source === 'estimate') score *= 0.95; // prefer items whose macros are verified
+      return { ...c, score, repeated, why: reasonFor(mode, c, situation) };
+    })
+    .sort((a, b) => b.score - a.score)
+    .filter((c) => {
+      // One suggestion per headline food, so the list is not three variations of a shake.
+      // Keyed on the label root rather than the id, because "PB&J" and "PB&J (large)" are
+      // two ids and one piece of advice.
+      const head = c.parts ? c.parts[0] : c;
+      const key = (head.label || head.id).toLowerCase().replace(/\s*\(.*?\)\s*/g, '').trim();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, limit);
+
+  return out;
+}
+
 // ---------- on-device text matching ----------
 //
 // Resolves typed entries against Matt's own food list before any API call is considered.

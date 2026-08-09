@@ -103,6 +103,22 @@ h2 { font-size: 12px; font-weight: 650; letter-spacing: .05em; text-transform: u
 .sync-bar.pending { background: color-mix(in srgb, var(--warn) 16%, var(--bg)); color: var(--txt); }
 .sync-bar.failed { background: color-mix(in srgb, var(--bad) 20%, var(--bg)); color: var(--txt); font-weight: 600; }
 
+/* ---- snack suggestions ---- */
+.suggest-headline { font-size: 14px; color: var(--txt2); margin: 0 0 10px; line-height: 1.45; }
+.suggestion {
+  display: flex; align-items: center; gap: 12px; width: 100%; text-align: left;
+  background: var(--surface2); border: 1px solid var(--border); border-radius: 12px;
+  padding: 11px 13px; margin-bottom: 8px; cursor: pointer; color: inherit; font: inherit;
+}
+.suggestion:active { background: color-mix(in srgb, var(--accent) 10%, var(--surface2)); }
+.suggestion.repeated { opacity: .78; }
+.suggestion .s-main { flex: 1; min-width: 0; }
+.suggestion .s-label { font-weight: 600; font-size: 15px; }
+.suggestion .s-why { font-size: 12px; color: var(--txt2); margin-top: 2px; line-height: 1.4; }
+.suggestion .s-macros { text-align: right; flex-shrink: 0; }
+.suggestion .s-macros b { display: block; font-size: 16px; font-variant-numeric: tabular-nums; }
+.suggestion .s-macros span { font-size: 11px; color: var(--txt3); }
+
 .view { padding: 12px; display: flex; flex-direction: column; gap: 12px; max-width: 720px; margin: 0 auto; }
 
 .card {
