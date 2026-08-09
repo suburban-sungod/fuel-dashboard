@@ -53,7 +53,12 @@ async function boot() {
 
   // A desktop tab can sit focused for hours without a single visibilitychange, so focus
   // alone is not enough — poll gently while the window is actually being looked at.
-  setInterval(() => { if (!document.hidden) refreshData(); }, 5 * 60 * 1000);
+  readBuildTag().then((t) => { buildTag = t; });
+  setInterval(async () => {
+    if (document.hidden) return;
+    if (await checkForNewBuild()) return;
+    refreshData();
+  }, 5 * 60 * 1000);
 
   // Midnight crossed with the app still open otherwise leaves it logging into yesterday.
   // Only follow the clock if he was actually sitting on today; never yank him off a day
@@ -412,6 +417,20 @@ function renderFlags(t, tot) {
 
 function hhmm(min) { return `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`; }
 
+/**
+ * Seconds since an entry was logged. Prefers the stamp written at log time; falls back to
+ * its clock time for entries logged before that stamp existed. Null for any other day,
+ * where "how long has this been spinning" is not a meaningful question.
+ */
+function entryAgeSec(e) {
+  if (e.logged_at) return (Date.now() - e.logged_at) / 1000;
+  if (state.date !== F.isoDate(new Date())) return null;
+  const m = F.minutesOf(e.time);
+  if (m == null) return null;
+  const now = new Date();
+  return (now.getHours() * 60 + now.getMinutes() - m) * 60;
+}
+
 // ---------- entries, grouped into meals ----------
 
 function renderEntries() {
@@ -432,7 +451,15 @@ function renderEntries() {
       const row = el('div', 'entry' + (pending ? ' pending' : '') + (failed ? ' failed' : ''));
 
       let macros;
-      if (pending) macros = '<span class="spin"></span>estimating macros…';
+      if (pending) {
+        // A spinner that spins forever is worse than no spinner. Past a minute — four times
+        // the round trip actually observed — say so and give him a button, rather than
+        // implying the app is still working on it when it may simply not have looked.
+        const age = entryAgeSec(e);
+        macros = age != null && age > 60
+          ? `<span class="spin"></span>still estimating after ${Math.round(age)}s · <b class="recheck">check now</b>`
+          : '<span class="spin"></span>estimating macros…';
+      }
       else if (failed) macros = `couldn't estimate — ${escapeHtml(e.parse_error || 'unknown error')}`;
       else {
         macros = `${num(e.kcal)} kcal · ${num(e.protein)}P · ${num(e.carbs)}C · ${num(e.fat)}F`;
@@ -450,7 +477,10 @@ function renderEntries() {
       // Tap the row to edit. Delete-and-retype was the only way to change a portion or
       // fix a time, and on a failed parse it meant retyping the food itself.
       const main = row.querySelector('.e-main');
-      main.onclick = () => openSheet(e);
+      main.onclick = (ev) => {
+        if (ev.target.classList.contains('recheck')) { refreshData({ force: true }); return; }
+        openSheet(e);
+      };
       main.style.cursor = 'pointer';
 
       const del = el('button', 'e-del', '×');
@@ -959,7 +989,9 @@ function addCustom() {
       ? { id, time, label: hit.label, kcal: hit.kcal, protein: hit.protein, carbs: hit.carbs,
           fat: hit.fat, source: 'matched', note: hit.anyEstimate ? 'includes an estimated item' : '' }
       : { id, time, label, kcal: 0, protein: 0, carbs: 0, fat: 0,
-          source: 'freetext', parse_state: 'pending', note: '' };
+          // Stamped so the UI can tell a spinner that is 5 seconds old from one that is
+          // three minutes old. The clock time alone cannot: he backdates entries.
+          source: 'freetext', parse_state: 'pending', note: '', logged_at: Date.now() };
   }
 
   // Editing replaces in place and keeps the id, so the parser and the merge both still
@@ -1041,10 +1073,42 @@ async function parseTick() {
     }
     changed = true;
   }
-  if (changed) render();
-
-  if (!datesAwaitingParse().length) return stopWatch();
+  if (!datesAwaitingParse().length) { if (changed) render(); return stopWatch(); }
+  // Re-render even when nothing arrived, so the "still estimating after Ns" counter is
+  // honest about how long he has actually been waiting.
+  render();
   if (Date.now() < parseDeadline) reschedule();
+}
+
+// ---------- staying current with the deployed build ----------
+//
+// Every fix so far has landed with "reload the tab" attached to it, and an installed PWA
+// is resumed rather than reloaded, so it can run week-old code indefinitely while looking
+// perfectly healthy. The app should not need a human to notice it is out of date.
+//
+// GitHub Pages serves an ETag on app.js. A HEAD against it is a few bytes, does not touch
+// the GitHub API and so cannot affect the rate limit. If the tag has moved, a new build is
+// live and this one is stale.
+
+let buildTag = null;
+
+async function readBuildTag() {
+  try {
+    const res = await fetch('./app.js', { method: 'HEAD', cache: 'no-store' });
+    return res.headers.get('etag') || res.headers.get('last-modified') || null;
+  } catch {
+    return null;
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await readBuildTag();
+  if (!tag || !buildTag || tag === buildTag) return false;
+  // Never reload out from under an unsent write or a half-typed entry. The queue survives
+  // a reload, but losing what he is mid-way through typing would be its own bug.
+  if (S.pendingCount() || !$('#sheet').hidden) return false;
+  location.reload();
+  return true;
 }
 
 // ---------- staying current with the repo ----------
@@ -1104,6 +1168,7 @@ async function refreshData({ force = false } = {}) {
  * reopens the parse window.
  */
 async function resume() {
+  if (await checkForNewBuild()) return;   // reloading; nothing else is worth starting
   await flush();
   await refreshData();
   watchForParse(true);
