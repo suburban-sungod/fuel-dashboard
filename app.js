@@ -204,6 +204,7 @@ function wire() {
   $$('.seg-btn').forEach((b) => b.onclick = () => selectTab(b.dataset.tab));
   $('#c-save').onclick = addCustom;
   $('#add-entry').onclick = () => openSheet();
+  $('#add-entry-bottom').onclick = () => openSheet();
   $('#weight-save-today').onclick = logWeight;
 }
 
@@ -218,7 +219,17 @@ function render() {
   ['today', 'trends', 'ref'].forEach((v) => { $('#view-' + v).hidden = state.view !== v; });
   $$('.tab').forEach((b) => b.classList.toggle('active', b.dataset.view === state.view));
 
-  if (state.view === 'today') { renderHero(); renderToday(); renderEntries(); renderSuggestions(); renderPlan(); renderConfounders(); }
+  if (state.view === 'today') {
+    renderHero(); renderToday(); renderEntries(); renderDayClose();
+    // A closed day is a decision, and the app should stop arguing with it. Advice about
+    // what to eat next, on a day he has just declared finished, is noise at best and an
+    // invitation to undo it at worst.
+    const quiet = dayIsClosed();
+    $('#card-suggest').hidden = quiet;
+    $('#card-plan').hidden = quiet;
+    if (!quiet) { renderSuggestions(); renderPlan(); }
+    renderConfounders();
+  }
   if (state.view === 'trends') { renderWeight(); renderCalChart(); renderProteinChart(); renderTable(); }
   if (state.view === 'ref') renderSettings();
   renderSyncBar();
@@ -268,6 +279,39 @@ function timeAgo(ms) {
   if (s < 3600) return `${Math.round(s / 60)} min ago`;
   if (s < 86400) return `${Math.round(s / 3600)}h ago`;
   return `${Math.round(s / 86400)}d ago`;
+}
+
+// ---------- closing the day ----------
+//
+// The week number holds the current day out of its totals on purpose: half a day of eating
+// always looks like a huge deficit, and that is the flattering error this page exists to
+// kill. But he stops eating around eight, not at midnight, so for the last few hours of
+// every evening the headline is stale by design and there is nothing he can do about it.
+//
+// Closing the day is him saying "that was the last of the food". It folds the day into the
+// week immediately and stops the app suggesting more.
+
+function dayIsClosed(date = state.date) {
+  return !!state.logs[date]?.closed;
+}
+
+function renderDayClose() {
+  const btn = $('#close-day');
+  // Only the current day is ever held open, so only the current day has anything to close.
+  const isToday = state.date === F.isoDate(new Date());
+  btn.hidden = !isToday;
+  if (!isToday) return;
+
+  const closed = dayIsClosed();
+  btn.textContent = closed ? 'Day closed · reopen' : 'Close the day';
+  btn.classList.toggle('is-closed', closed);
+  btn.onclick = async () => {
+    // Reopening deletes the flag rather than writing `closed: false`, so the log keeps
+    // saying only what happened.
+    const { closed: _prev, ...day } = today();
+    await saveDay(closed ? { ...day, date: state.date } : { ...day, date: state.date, closed: true });
+    S.dbg(`day ${state.date} ${closed ? 'reopened' : 'closed'}`);
+  };
 }
 
 // ---------- hero: week-to-date deficit vs plan ----------
@@ -391,7 +435,9 @@ function renderFlags(t, tot) {
 
   const meals = F.mealClusters(today().entries, state.athlete);
   const short = meals.filter((m) => m.proteinShort);
-  if (short.length) {
+  // Same reason the suggester goes quiet: on a closed day this is a complaint about a
+  // meal he can no longer do anything about.
+  if (short.length && !dayIsClosed()) {
     add('warn', `<b>${short.length} ${short.length === 1 ? 'meal' : 'meals'} under ${state.athlete.protein_min_per_meal_g}g protein.</b> Distribution matters as much as the daily total — ${short.map((m) => hhmm(m.start)).join(', ')}.`);
   }
 

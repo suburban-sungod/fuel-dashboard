@@ -224,6 +224,17 @@ h2 { font-size: 12px; font-weight: 650; letter-spacing: .05em; text-transform: u
 }
 .btn-primary.small { width: auto; padding: 7px 14px; font-size: 13px; border-radius: 9px; }
 
+/* Closing the day is a deliberate, occasional act, not the primary action in this card —
+   it sits beside the Log button without competing with it for the thumb. */
+.btn-quiet {
+  background: transparent; color: var(--muted); border: 1px solid var(--border);
+  border-radius: 9px; padding: 7px 14px; font-size: 13px; font-weight: 600;
+  cursor: pointer; font-family: inherit;
+}
+.btn-quiet.is-closed { color: var(--accent); border-color: var(--accent); }
+
+.meals-footer { margin: 14px 0 0; }
+
 input[type="text"], input[type="number"], input[type="password"], input[type="time"] {
   width: 100%; padding: 11px 13px; font-size: 16px; /* 16px stops iOS zooming on focus */
   border: 1px solid var(--border); border-radius: 11px;

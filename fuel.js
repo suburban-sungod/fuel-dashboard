@@ -321,6 +321,11 @@ export function mealClusters(entries, athlete) {
  *
  * Days with nothing logged are excluded from both sides rather than counted as
  * zero intake, which would read as a huge phantom deficit.
+ *
+ * `openDate` is the in-progress day, held out of the totals. A day carrying `closed: true`
+ * is never open, whatever the clock says: he finishes eating hours before midnight, and
+ * making him wait for the date to roll to see the number he has already earned is the
+ * difference between a dashboard he checks after dinner and one he checks tomorrow.
  */
 export function cumulativeDeficit(dates, ctx, logs, openDate = null) {
   let actual = 0;
@@ -334,7 +339,7 @@ export function cumulativeDeficit(dates, ctx, logs, openDate = null) {
     const t = targetsFor(iso, ctx);
     const intake = dayTotals(entries).kcal;
     const logged = entries.length > 0;
-    const isOpen = iso === openDate;
+    const isOpen = iso === openDate && !log?.closed;
 
     // The in-progress day is reported separately, never added to the totals. A day that is
     // only half eaten looks like a huge deficit, and that is exactly the flattering error
