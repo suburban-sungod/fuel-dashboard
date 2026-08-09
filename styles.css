@@ -101,6 +101,7 @@ h2 { font-size: 12px; font-weight: 650; letter-spacing: .05em; text-transform: u
 
 .sync-bar { font-size: 12px; padding: 6px 16px; text-align: center; background: var(--surface2); color: var(--txt2); }
 .sync-bar.pending { background: color-mix(in srgb, var(--warn) 16%, var(--bg)); color: var(--txt); }
+.sync-bar.failed { background: color-mix(in srgb, var(--bad) 20%, var(--bg)); color: var(--txt); font-weight: 600; }
 
 .view { padding: 12px; display: flex; flex-direction: column; gap: 12px; max-width: 720px; margin: 0 auto; }
 

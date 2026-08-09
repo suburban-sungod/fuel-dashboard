@@ -5,6 +5,10 @@ const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
 const el = (t, c, h) => { const n = document.createElement(t); if (c) n.className = c; if (h != null) n.innerHTML = h; return n; };
 const num = (n) => (n == null ? '—' : Math.round(n).toLocaleString());
+// `new Date('2026-08-09')` is parsed as UTC midnight and then displayed in local time, so
+// every date label silently shifts a day in any negative UTC offset. Harmless in Sydney,
+// wrong the moment he opens this in the US. Append a time and it parses as local.
+const localDate = (iso) => new Date(iso + 'T00:00:00');
 const signed = (n) => (n == null ? '—' : (n >= 0 ? '+' : '−') + Math.abs(Math.round(n)).toLocaleString());
 
 const state = {
@@ -12,6 +16,9 @@ const state = {
   workouts: [], planned: [], logs: {}, months: {}, status: null,
   date: F.isoDate(new Date()), view: 'today', pendingTab: 'meals',
 };
+
+// The real calendar date as of the last check, so a midnight rollover can be detected.
+let rolloverDate = F.isoDate(new Date());
 
 // ============ boot ============
 
@@ -24,11 +31,56 @@ async function boot() {
     $('#sync-bar').hidden = false;
     $('#sync-bar').textContent = `Offline — showing last synced data. (${err.message})`;
   }
+
+  // Without a profile there is nothing to compute a single number from, and every render
+  // path dereferences it. Say so plainly instead of throwing behind a bar that claims to
+  // be showing last synced data — the failure case is a newly paired phone on bad signal,
+  // where an empty cache plus a failed fetch otherwise leaves a blank screen and no clue.
+  if (!state.athlete) return showLoadFailure();
   wire();
   render();
   flush();
+  watchForParse();
   setInterval(flush, 60000);
   window.addEventListener('online', flush);
+
+  // iOS suspends timers in a backgrounded tab, so the 60s flush stops dead the moment the
+  // phone is locked. Without these two listeners a logged entry can sit unsent for as long
+  // as the app is away — which is exactly how the first free-text entry appeared to hang
+  // for eleven minutes.
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) resume(); });
+  window.addEventListener('focus', resume);
+
+  // Midnight crossed with the app still open otherwise leaves it logging into yesterday.
+  // Only follow the clock if he was actually sitting on today; never yank him off a day
+  // he deliberately paged back to.
+  setInterval(async () => {
+    const now = F.isoDate(new Date());
+    if (now === rolloverDate) return;
+    const wasOnToday = state.date === rolloverDate;
+    rolloverDate = now;
+    if (!wasOnToday) return render();
+    state.date = now;
+    await loadMonths([now]);
+    render();
+  }, 60000);
+}
+
+function showLoadFailure() {
+  $('#app').hidden = true;
+  $('#gate').hidden = false;
+  $('#gate').innerHTML = `<div class="gate-card">
+    <h1>Can't load your profile</h1>
+    <p class="muted">The app reached this device but couldn't read <code>athlete.json</code> from
+    the private repo, and there is no cached copy here yet. Nothing is lost — this device just
+    has nothing to work from.</p>
+    <p class="muted">Usually one of: no signal right now, the token has expired, or the token
+    was issued without <strong>Contents: Read and write</strong> on <code>fuel-data</code>.</p>
+    <button id="retry" class="btn-primary">Try again</button>
+    <button id="reset-token" class="link-btn" style="margin-top:10px">Use a different token</button>
+  </div>`;
+  $('#retry').onclick = () => location.reload();
+  $('#reset-token').onclick = () => { S.clearToken(); location.reload(); };
 }
 
 function showGate() {
@@ -60,7 +112,7 @@ async function loadAll() {
     S.readJSON(S.paths.status, null),
   ]);
   Object.assign(state, { athlete, weights, templates, workouts, planned, status });
-  await loadMonths(F.weekDates(state.date).concat(recentDates(21)));
+  await loadMonths(F.weekDates(state.date, F.isoDate(new Date())).concat(recentDates(21)));
 }
 
 function recentDates(n) {
@@ -104,9 +156,14 @@ function ctx() {
 
 function today() { return state.logs[state.date] || { date: state.date, entries: [], confounders: [] }; }
 
-function saveDay(day) {
-  state.logs[day.date] = day;
+async function saveDay(day) {
   const key = day.date.slice(0, 7);
+  // Never write a month file this device has not read. Building one from scratch queues a
+  // file holding a single day, and only the conflict handler stops that flattening the
+  // rest of the month on GitHub — far too much to rest on a path that runs this rarely.
+  if (!state.months[key]) await loadMonths([day.date]);
+
+  state.logs[day.date] = day;
   const month = state.months[key] || { month: key, days: {} };
   const { date, ...rest } = day;
   month.days = { ...month.days, [day.date]: rest };
@@ -124,24 +181,21 @@ function wire() {
   $('#day-today').onclick = () => { state.date = F.isoDate(new Date()); render(); };
 
   $$('.tab').forEach((b) => b.onclick = () => { state.view = b.dataset.view; render(); });
-  $('#add-entry').onclick = openSheet;
   $('#toggle-table').onclick = () => { const t = $('#day-table'); t.hidden = !t.hidden; };
   $('#weight-save').onclick = logWeight;
 
   $$('[data-close]').forEach((n) => n.onclick = closeSheet);
-  $$('.seg-btn').forEach((b) => b.onclick = () => {
-    state.pendingTab = b.dataset.tab;
-    $$('.seg-btn').forEach((x) => x.classList.toggle('active', x === b));
-    ['meals', 'singles', 'custom'].forEach((t) => { $('#sheet-' + t).hidden = t !== b.dataset.tab; });
-  });
+  $$('.seg-btn').forEach((b) => b.onclick = () => selectTab(b.dataset.tab));
   $('#c-save').onclick = addCustom;
+  $('#add-entry').onclick = () => openSheet();
+  $('#weight-save-today').onclick = logWeight;
 }
 
 // ============ render ============
 
 function render() {
   const isToday = state.date === F.isoDate(new Date());
-  $('#day-label').textContent = isToday ? 'Today' : new Date(state.date).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
+  $('#day-label').textContent = isToday ? 'Today' : localDate(state.date).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
   $('#day-today').hidden = isToday;
   $('#day-next').disabled = state.date >= F.isoDate(new Date());
 
@@ -157,7 +211,14 @@ function render() {
 function renderSyncBar() {
   const bar = $('#sync-bar');
   const p = S.pendingCount();
-  if (p) {
+  const stuck = S.stuckWrite();
+  if (stuck) {
+    // "Waiting to sync" reads as patience. After two failed attempts it is not waiting,
+    // it is stuck, and he needs to know his food log is only on this phone.
+    bar.hidden = false;
+    bar.className = 'sync-bar failed';
+    bar.textContent = `${p} ${p === 1 ? 'change is' : 'changes are'} stuck on this phone and not reaching GitHub — ${stuck.lastError}`;
+  } else if (p) {
     bar.hidden = false;
     bar.className = 'sync-bar pending';
     bar.textContent = `${p} ${p === 1 ? 'change' : 'changes'} saved on this phone, waiting to sync`;
@@ -180,8 +241,10 @@ function timeAgo(ms) {
 // ---------- hero: week-to-date deficit vs plan ----------
 
 function renderHero() {
-  const dates = F.weekDates(state.date);
   const realToday = F.isoDate(new Date());
+  // Cap the week at the real today, never at the day being viewed — otherwise paging back
+  // to a Wednesday reports a finished week as a three-day one.
+  const dates = F.weekDates(state.date, realToday);
   const wk = F.cumulativeDeficit(dates, ctx(), state.logs, realToday);
 
   const n = $('#hero-number');
@@ -189,7 +252,7 @@ function renderHero() {
   n.className = 'hero-number ' + cls;
   n.textContent = wk.loggedDays === 0 ? 'No closed days yet' : `${signed(wk.variance)} kcal`;
 
-  $('#hero-week').textContent = `from Mon ${new Date(F.weekStart(state.date)).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })}`;
+  $('#hero-week').textContent = `from Mon ${localDate(F.weekStart(state.date)).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })}`;
 
   // Today is shown live but never folded into the total — half a day of eating always
   // looks like a deficit, and that is the flattering error this page exists to kill.
@@ -211,7 +274,7 @@ function renderHero() {
       const h = Math.max(4, (Math.abs(d.variance) / max) * 34);
       b.appendChild(el('i')).style.height = h + 'px';
     }
-    b.appendChild(el('span', '', new Date(d.date).toLocaleDateString(undefined, { weekday: 'narrow' })));
+    b.appendChild(el('span', '', localDate(d.date).toLocaleDateString(undefined, { weekday: 'narrow' })));
     b.title = d.open
       ? `${d.date}: still open, ate ${num(d.intake)} of ${num(d.target)} so far`
       : d.logged
@@ -363,6 +426,13 @@ function renderEntries() {
           <div class="e-macros">${macros}</div>
           ${e.note ? `<div class="e-note">${escapeHtml(e.note)}</div>` : ''}
         </div>`;
+
+      // Tap the row to edit. Delete-and-retype was the only way to change a portion or
+      // fix a time, and on a failed parse it meant retyping the food itself.
+      const main = row.querySelector('.e-main');
+      main.onclick = () => openSheet(e);
+      main.style.cursor = 'pointer';
+
       const del = el('button', 'e-del', '×');
       del.onclick = () => {
         const day = { ...today(), entries: today().entries.filter((x) => x.id !== e.id) };
@@ -529,7 +599,7 @@ function renderWeight() {
   } else { note.hidden = true; }
 }
 
-function shortDate(iso) { return new Date(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }); }
+function shortDate(iso) { return localDate(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }); }
 
 function renderCalChart() {
   const box = $('#cal-chart');
@@ -543,13 +613,29 @@ function renderCalChart() {
 
   const w = 640, h = 220;
   const svg = svgFrame(w, h);
-  const yMax = Math.max(3200, ...rows.map((r) => Math.max(r.intake, r.target || 0))) * 1.05;
+
+  // Scale to the bulk of the fortnight, not to its single biggest day. A five-hour ride
+  // can carry a 5,000 kcal target, and pinning the axis to that squashes the other
+  // thirteen days into the bottom third — losing the only thing the chart is for, which
+  // is how each day sat against its own target. Anything above the top is drawn clipped
+  // with a caret, so the outlier is still visible and obviously off-scale.
+  const spread = rows.flatMap((r) => [r.logged ? r.intake : 0, r.target || 0]).filter((v) => v > 0);
+  const yMax = Math.max(3200, F.percentile(spread, 0.9)) * 1.1;
   gridlines(svg, w, h, 0, yMax, (v) => (v / 1000).toFixed(1) + 'k');
 
   const bw = (w - PAD.l - PAD.r) / rows.length;
+  let clipped = 0;
   rows.forEach((r, i) => {
     const x = PAD.l + i * bw;
-    const H = (v) => ((v / yMax) * (h - PAD.t - PAD.b));
+    const H = (v) => Math.min(1, v / yMax) * (h - PAD.t - PAD.b);
+    const caret = (cx, over) => {
+      if (!over) return;
+      clipped++;
+      svg.appendChild(node('path', {
+        d: `M${cx - 4},${PAD.t + 4} L${cx},${PAD.t - 1} L${cx + 4},${PAD.t + 4}`,
+        fill: 'none', stroke: 'var(--txt3)', 'stroke-width': 1.5, 'stroke-linecap': 'round',
+      }));
+    };
     if (r.logged) {
       const over = r.target && r.intake > r.target;
       const bar = node('rect', {
@@ -558,21 +644,27 @@ function renderCalChart() {
       });
       bar.appendChild(node('title', {}, `${r.date}: ${num(r.intake)} kcal vs target ${num(r.target)}`));
       svg.appendChild(bar);
+      caret(x + bw / 2, r.intake > yMax);
     }
     if (r.target) {
-      svg.appendChild(node('line', {
+      const line = node('line', {
         x1: x + 1, x2: x + bw - 1, y1: h - PAD.b - H(r.target), y2: h - PAD.b - H(r.target),
         stroke: 'var(--txt2)', 'stroke-width': 2, 'stroke-linecap': 'round',
-      }));
+        ...(r.target > yMax ? { 'stroke-dasharray': '3 3' } : {}),
+      });
+      line.appendChild(node('title', {}, `${r.date}: target ${num(r.target)} kcal`));
+      svg.appendChild(line);
+      caret(x + bw / 2, r.target > yMax);
     }
-    if (i % 2 === 0) svg.appendChild(node('text', { x: x + bw / 2, y: h - 5, 'text-anchor': 'middle', fill: 'var(--txt3)', 'font-size': 9 }, new Date(r.date).getDate()));
+    if (i % 2 === 0) svg.appendChild(node('text', { x: x + bw / 2, y: h - 5, 'text-anchor': 'middle', fill: 'var(--txt3)', 'font-size': 9 }, localDate(r.date).getDate()));
   });
 
   box.appendChild(svg);
   $('#cal-legend').innerHTML = `
     <span><i style="background:var(--s3)"></i>At or under target</span>
     <span><i style="background:var(--s2)"></i>Over target</span>
-    <span><i style="background:var(--txt2);height:2px;border-radius:1px"></i>Target</span>`;
+    <span><i style="background:var(--txt2);height:2px;border-radius:1px"></i>Target</span>
+    ${clipped ? '<span><i style="background:transparent">↑</i>Above the scale — big day, hover for the number</span>' : ''}`;
 }
 
 function renderProteinChart() {
@@ -605,7 +697,7 @@ function renderProteinChart() {
       svg.appendChild(bar);
     }
     if (r.target) svg.appendChild(node('line', { x1: x + 1, x2: x + bw - 1, y1: h - PAD.b - H(r.target), y2: h - PAD.b - H(r.target), stroke: 'var(--txt2)', 'stroke-width': 2, 'stroke-linecap': 'round' }));
-    if (i % 2 === 0) svg.appendChild(node('text', { x: x + bw / 2, y: h - 5, 'text-anchor': 'middle', fill: 'var(--txt3)', 'font-size': 9 }, new Date(r.date).getDate()));
+    if (i % 2 === 0) svg.appendChild(node('text', { x: x + bw / 2, y: h - 5, 'text-anchor': 'middle', fill: 'var(--txt3)', 'font-size': 9 }, localDate(r.date).getDate()));
   });
   box.appendChild(svg);
 }
@@ -647,18 +739,65 @@ function renderSettings() {
       <li>Pending writes <span>${S.pendingCount()}</span></li>
     </div>
     <button id="signout" class="btn-primary" style="margin-top:14px;background:var(--bad)">Remove token from this device</button>`;
-  $('#signout').onclick = () => { if (confirm('Remove the token from this phone? Your data stays in the repo.')) { S.clearToken(); location.reload(); } };
+  $('#signout').onclick = () => {
+    // Say what actually goes. This wipes the local copy of the log, not just the token.
+    const unsynced = S.unsyncedSummary();
+    const warn = unsynced.length
+      ? `\n\n⚠️ ${unsynced.length} change${unsynced.length === 1 ? '' : 's'} on this phone ${unsynced.length === 1 ? 'has' : 'have'} NOT reached GitHub yet and will be lost:\n${unsynced.map((m) => '• ' + m).join('\n')}`
+      : '';
+    const msg =
+      'Sign out of this device?\n\nThis deletes the token AND the local copy of your food log, ' +
+      'weight history and workouts from this phone. Everything already synced stays safe in ' +
+      'the private repo and comes back when you paste the token again.' + warn;
+    if (!confirm(msg)) return;
+    const { cachedFiles } = S.clearToken();
+    console.info(`Cleared token, ${cachedFiles} cached files and the write queue.`);
+    location.reload();
+  };
 }
 
 // ============ logging ============
 
-function openSheet() {
+/**
+ * Open the log sheet. Pass an entry to edit it in place instead of adding a new one —
+ * without this the only way to fix a portion, a time, or a food the parser choked on was
+ * to delete it and type the whole thing again.
+ */
+function openSheet(entry = null) {
+  state.editing = entry ? entry.id : null;
   const now = new Date();
-  $('#entry-time').value = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  $('#entry-time').value = entry
+    ? entry.time
+    : `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
   renderTiles();
+
+  const custom = { '#c-label': entry?.label ?? '', '#c-kcal': entry?.kcal || '',
+    '#c-protein': entry?.protein || '', '#c-carbs': entry?.carbs || '', '#c-fat': entry?.fat || '' };
+  for (const [sel, v] of Object.entries(custom)) $(sel).value = v;
+
+  $('#sheet-title').textContent = entry ? 'Edit' : 'Log';
+  $('#c-save').textContent = entry ? 'Save changes' : 'Add';
+  // Editing always uses the custom pane — the tile grids only make sense for adding. Show
+  // it without recording it as his choice, or one edit silently changes which tab the Log
+  // button opens on from then on.
+  showTab(entry ? 'custom' : state.pendingTab);
+  $$('.seg').forEach((s) => (s.hidden = !!entry));
+
   $('#sheet').hidden = false;
 }
-function closeSheet() { $('#sheet').hidden = true; }
+
+function showTab(tab) {
+  $$('.seg-btn').forEach((x) => x.classList.toggle('active', x.dataset.tab === tab));
+  ['meals', 'singles', 'custom'].forEach((t) => { $('#sheet-' + t).hidden = t !== tab; });
+}
+
+/** He picked this one, so remember it for next time. */
+function selectTab(tab) {
+  state.pendingTab = tab;
+  showTab(tab);
+}
+
+function closeSheet() { $('#sheet').hidden = true; state.editing = null; }
 
 function renderTiles() {
   const grid = $('#sheet-meals');
@@ -703,7 +842,8 @@ function addCustom() {
   const kcal = Number($('#c-kcal').value) || 0;
   const day = today();
   const time = $('#entry-time').value || '12:00';
-  const id = Math.random().toString(36).slice(2, 8);
+  const editingId = state.editing;
+  const id = editingId || Math.random().toString(36).slice(2, 8);
 
   let entry;
   if (kcal) {
@@ -726,49 +866,112 @@ function addCustom() {
           source: 'freetext', parse_state: 'pending', note: '' };
   }
 
-  saveDay({ ...day, entries: [...day.entries, entry].sort((a, b) => a.time.localeCompare(b.time)) });
+  // Editing replaces in place and keeps the id, so the parser and the merge both still
+  // recognise it as the same entry rather than resurrecting the old one alongside it.
+  const rest = editingId ? day.entries.filter((x) => x.id !== editingId) : day.entries;
+  saveDay({ ...day, entries: [...rest, entry].sort((a, b) => a.time.localeCompare(b.time)) });
+
   ['#c-label', '#c-kcal', '#c-protein', '#c-carbs', '#c-fat'].forEach((s) => ($(s).value = ''));
   closeSheet();
-  if (entry.source === 'freetext') pollForParse(day.date || state.date, entry.id);
+  if (entry.source === 'freetext') watchForParse();
+}
+
+// ---------- waiting on the parser ----------
+//
+// One watcher for the whole app, not one per tap. An entry routinely outlives the tap that
+// created it: iOS suspends timers the moment the phone is locked, so a write can sit unsent
+// for minutes. The first real free-text entry took eleven minutes to leave the phone and
+// twenty-two seconds to parse — a per-tap poll counting from the tap had long since expired
+// and left both entries spinning forever.
+
+const PARSE_WINDOW_MS = 90000;
+const PARSE_TICK_MS = 5000;
+let parseTimer = null;
+let parseDeadline = 0;
+
+/** Every loaded day still holding an entry the parser hasn't resolved. */
+function datesAwaitingParse() {
+  return Object.entries(state.logs)
+    .filter(([, day]) => (day.entries || []).some((e) => e.source === 'freetext' && e.parse_state !== 'failed'))
+    .map(([date]) => date);
 }
 
 /**
- * Wait for the GitHub Actions parser to fill in a free-text entry. Polls the month file
- * for 90s, which comfortably covers the ~20s round trip. Skips a tick while a local write
- * is still queued, so a fresh read can never clobber an entry that hasn't synced yet.
+ * Start or extend the watch. The window is measured from the moment the write actually
+ * leaves the phone, never from the tap — see the note above.
  */
-async function pollForParse(date, entryId) {
-  const key = date.slice(0, 7);
-  for (let i = 0; i < 18; i++) {
-    await new Promise((r) => setTimeout(r, 5000));
-    if (S.pendingCount()) continue;
-    let month;
-    try {
-      month = await S.readJSON(S.paths.month(date), null);
-    } catch {
-      continue;
-    }
-    const entry = (month?.days?.[date]?.entries || []).find((e) => e.id === entryId);
-    if (!entry) continue;
-    if (entry.source === 'freetext' && entry.parse_state !== 'failed') continue;
-
-    state.months[key] = month;
-    for (const [d, day] of Object.entries(month.days || {})) {
-      state.logs[d] = { date: d, entries: [], confounders: [], notes: '', ...day };
-    }
-    render();
-    return;
-  }
+function watchForParse(restart = true) {
+  if (!datesAwaitingParse().length) return stopWatch();
+  if (restart) parseDeadline = Date.now() + PARSE_WINDOW_MS;
+  if (!parseTimer) parseTimer = setTimeout(parseTick, PARSE_TICK_MS);
 }
 
+function stopWatch() {
+  if (parseTimer) clearTimeout(parseTimer);
+  parseTimer = null;
+}
+
+function reschedule() {
+  parseTimer = setTimeout(parseTick, PARSE_TICK_MS);
+}
+
+async function parseTick() {
+  parseTimer = null;
+  if (!datesAwaitingParse().length) return;
+
+  // A queued write means the entry has not reached GitHub yet, so there is nothing to
+  // find. Hold the deadline open rather than spending the window waiting on ourselves.
+  if (S.pendingCount()) {
+    parseDeadline = Date.now() + PARSE_WINDOW_MS;
+    return reschedule();
+  }
+
+  let changed = false;
+  for (const m of new Set(datesAwaitingParse().map((d) => d.slice(0, 7)))) {
+    const path = S.paths.month(m + '-01');
+    let got;
+    try { got = await S.peekJSON(path); } catch { continue; }
+    if (!got) continue;
+
+    // A write queued while that fetch was in flight makes the response stale the instant
+    // it arrives. Adopting it would overwrite the entry just logged, and the queued job
+    // would then push the overwritten file. Drop it and come back next tick.
+    if (S.pendingCount()) return reschedule();
+
+    S.adopt(path, got.value, got.sha);
+    state.months[m] = got.value;
+    for (const [d, day] of Object.entries(got.value.days || {})) {
+      state.logs[d] = { date: d, entries: [], confounders: [], notes: '', ...day };
+    }
+    changed = true;
+  }
+  if (changed) render();
+
+  if (!datesAwaitingParse().length) return stopWatch();
+  if (Date.now() < parseDeadline) reschedule();
+}
+
+/**
+ * Called when the app comes back to the foreground. Flushes anything the suspended timer
+ * failed to send, then reopens the parse window — the entries waiting on it have just had
+ * their best chance to land while the screen was off.
+ */
+async function resume() {
+  await flush();
+  watchForParse(true);
+}
+
+/** Reads whichever weigh-in box has a value — Today and Trends both have one. */
 function logWeight() {
-  const kg = Number($('#weight-input').value);
+  const boxes = ['#weight-input-today', '#weight-input'].map((s) => $(s)).filter(Boolean);
+  const box = boxes.find((b) => b.value !== '');
+  const kg = Number(box?.value);
   if (!kg || kg < 40 || kg > 200) return;
   const weights = [...state.weights.filter((w) => w.date !== state.date), { date: state.date, kg }]
     .sort((a, b) => a.date.localeCompare(b.date));
   state.weights = weights;
   S.queueWrite(S.paths.weight, weights, `weight: ${state.date} ${kg}kg`);
-  $('#weight-input').value = '';
+  boxes.forEach((b) => (b.value = ''));
   render();
   flush();
 }

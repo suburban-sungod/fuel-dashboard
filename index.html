@@ -74,6 +74,12 @@
       <div id="today-stats" class="stats"></div>
       <div id="today-bars" class="bars"></div>
       <div id="today-flags" class="flags"></div>
+      <!-- Weighing was only possible from the Trends tab, which is not where he is at
+           7am with the scales under his feet. -->
+      <div class="row-between weigh-in">
+        <input id="weight-input-today" type="number" step="0.1" inputmode="decimal" placeholder="Weigh in (kg)" aria-label="Weight in kilograms">
+        <button id="weight-save-today" class="btn-primary small">Log</button>
+      </div>
     </div>
 
     <div class="card">
@@ -186,7 +192,7 @@
   <div class="sheet-body">
     <div class="sheet-head">
       <button class="link-btn" data-close>Cancel</button>
-      <strong>Log</strong>
+      <strong id="sheet-title">Log</strong>
       <input id="entry-time" type="time" step="60">
     </div>
 

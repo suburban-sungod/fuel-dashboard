@@ -38,8 +38,31 @@ export function setToken(t) {
   localStorage.setItem(LS.token, (t || '').trim());
 }
 
+/**
+ * Remove the token AND everything it fetched. The cache holds the full food log, the
+ * weight history and the workouts in plain text — leaving it behind means a button
+ * labelled "remove the token" quietly leaves all the private data on the device, which
+ * defeats the entire reason the data lives in a separate private repo.
+ *
+ * Returns what it deleted so the UI can say so honestly.
+ */
 export function clearToken() {
-  localStorage.removeItem(LS.token);
+  // length/key() rather than Object.keys: it is the actual Storage API, so it behaves the
+  // same everywhere and is testable outside a browser.
+  const cacheKeys = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && k.startsWith(LS.cache)) cacheKeys.push(k);
+  }
+  const dropped = pendingCount();
+  cacheKeys.forEach((k) => localStorage.removeItem(k));
+  [LS.token, LS.queue, LS.lastSync].forEach((k) => localStorage.removeItem(k));
+  return { cachedFiles: cacheKeys.length, unsyncedWrites: dropped };
+}
+
+/** Anything logged on this device that has not reached GitHub yet. */
+export function unsyncedSummary() {
+  return getQueue().map((j) => j.message || j.path);
 }
 
 export async function verifyToken(token) {
@@ -109,6 +132,10 @@ export async function readJSON(path, fallback = null) {
       cache: 'no-store',
     });
     if (res.status === 404) {
+      // Only treat a 404 as "this file does not exist" the first time. Once there is a
+      // cached copy, a 404 is far more likely to be a token that lost access than a file
+      // that vanished — and caching the fallback over real data throws the log away.
+      if (cached) return cached.value;
       cacheSet(path, fallback, null);
       return fallback;
     }
@@ -126,6 +153,31 @@ export async function readJSON(path, fallback = null) {
 
 export function cachedSha(path) {
   return cacheGet(path)?.sha ?? null;
+}
+
+/**
+ * Read straight from GitHub without touching the local cache, and without falling back
+ * to it. The parse watcher needs this: `readJSON` caches what it reads, so an entry
+ * logged while a read was in flight would be overwritten by the response, and the write
+ * already queued for it would then push the clobbered file back to GitHub.
+ *
+ * The caller decides when it is safe to keep the result — see `adopt`.
+ */
+export async function peekJSON(path) {
+  const token = getToken();
+  if (!token) return null;
+  const res = await fetch(`${API}/repos/${OWNER}/${REPO}/contents/${path}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' },
+    cache: 'no-store',
+  });
+  if (!res.ok) return null;
+  const meta = await res.json();
+  return { value: JSON.parse(b64decode(meta.content)), sha: meta.sha };
+}
+
+/** Accept a peeked copy into the cache. Only call this with no writes queued. */
+export function adopt(path, value, sha) {
+  cacheSet(path, value, sha);
 }
 
 // ---------- writes ----------
@@ -177,15 +229,25 @@ async function putFile(path, value, message, sha) {
  * re-applied on top, so a write from another device is never silently clobbered.
  */
 export async function flushQueue(onMerge) {
-  if (!getToken() || !navigator.onLine) return { flushed: 0, failed: pendingCount() };
+  if (!getToken() || !navigator.onLine) {
+    return { flushed: 0, failed: pendingCount(), error: navigator.onLine ? null : 'offline' };
+  }
   let flushed = 0;
   let failed = 0;
+  // A write that fails forever used to be indistinguishable from one that had simply not
+  // been tried yet: both showed "waiting to sync". Keep the reason so the UI can tell him
+  // his food log is not reaching GitHub, rather than implying it is merely in a queue.
+  let error = null;
 
   for (const job of getQueue()) {
     const cached = cacheGet(job.path);
     if (!cached) continue;
     try {
-      let res = await putFile(job.path, cached.value, job.message, cached.sha);
+      // What we actually sent. On a merge this stops being the local copy, and the cache
+      // has to end up holding the merged result — caching the pre-merge copy against the
+      // post-merge sha would look fine and then silently undo the merge on the next write.
+      let sent = cached.value;
+      let res = await putFile(job.path, sent, job.message, cached.sha);
 
       if (res.status === 409 || res.status === 422) {
         const fresh = await fetch(`${API}/repos/${OWNER}/${REPO}/contents/${job.path}`, {
@@ -195,24 +257,45 @@ export async function flushQueue(onMerge) {
         if (fresh.ok) {
           const meta = await fresh.json();
           const remote = JSON.parse(b64decode(meta.content));
-          const merged = onMerge ? onMerge(job.path, remote, cached.value) : cached.value;
-          cacheSet(job.path, merged, meta.sha);
-          res = await putFile(job.path, merged, job.message + ' (merged)', meta.sha);
+          sent = onMerge ? onMerge(job.path, remote, cached.value) : cached.value;
+          cacheSet(job.path, sent, meta.sha);
+          res = await putFile(job.path, sent, job.message + ' (merged)', meta.sha);
         }
       }
 
-      if (!res.ok) throw new Error(`GitHub ${res.status}`);
+      if (!res.ok) {
+        let why = `GitHub ${res.status}`;
+        if (res.status === 403) why = 'GitHub refused the write (403) — the token is probably read-only or expired';
+        if (res.status === 404) why = 'GitHub returned 404 — the token has lost access to fuel-data';
+        if (res.status === 401) why = 'Token rejected (401) — it has expired or been revoked';
+        throw new Error(why);
+      }
       const out = await res.json();
-      cacheSet(job.path, cached.value, out.content.sha);
+      cacheSet(job.path, sent, out.content.sha);
       dequeue(job.path);
       flushed++;
-    } catch {
+    } catch (e) {
       failed++;
+      error = error || e.message;
+      markAttempt(job.path, e.message);
     }
   }
 
   if (flushed) localStorage.setItem(LS.lastSync, String(Date.now()));
-  return { flushed, failed };
+  return { flushed, failed, error };
+}
+
+/** Record that a queued write was tried and failed, so the UI can stop calling it "waiting". */
+function markAttempt(path, message) {
+  const q = getQueue().map((j) =>
+    j.path === path ? { ...j, attempts: (j.attempts || 0) + 1, lastError: message } : j
+  );
+  localStorage.setItem(LS.queue, JSON.stringify(q));
+}
+
+/** The oldest stuck write, if any write has now failed more than once. */
+export function stuckWrite() {
+  return getQueue().find((j) => (j.attempts || 0) >= 2) || null;
 }
 
 function dequeue(path) {
@@ -234,9 +317,35 @@ export const paths = {
   month: (iso) => `log/${iso.slice(0, 7)}.json`,
 };
 
+/** An entry still waiting on the parser: free text, no macros yet, not given up on. */
+function awaitingParse(e) {
+  return e?.source === 'freetext' && e.parse_state !== 'failed';
+}
+
+/**
+ * Pick between two copies of the same entry. Local wins by default — it is the newer
+ * edit in every ordinary case — EXCEPT where the local copy is still awaiting the parser
+ * and the remote one has been resolved.
+ *
+ * That exception is the whole point. The parser rewrites entries in place on GitHub, so a
+ * phone holding the pre-parse copy is stale even though its copy is the "local" one.
+ * Straight local-wins pushes zero macros back over resolved ones, silently understating
+ * the day and making the parser re-bill for food it has already estimated.
+ */
+function preferEntry(remote, local) {
+  if (!remote) return local;
+  if (!local) return remote;
+  if (awaitingParse(local) && !awaitingParse(remote)) return remote;
+  return local;
+}
+
 /**
  * Merge rule for month files: union days, and within a shared day union entries by id.
  * Lets the phone and the desktop both write the same month without either losing work.
+ *
+ * Known gap: a deletion on one device is resurrected by the other device's copy, because
+ * a union cannot tell "deleted here" from "not yet seen here". Fixing that needs
+ * tombstones, which is a bigger change than this merge.
  */
 export function mergeMonth(path, remote, local) {
   if (!path.startsWith('log/')) return local;
@@ -246,7 +355,7 @@ export function mergeMonth(path, remote, local) {
     if (!remoteDay) { days[date] = localDay; continue; }
     const byId = new Map();
     for (const e of remoteDay.entries || []) byId.set(e.id, e);
-    for (const e of localDay.entries || []) byId.set(e.id, e);
+    for (const e of localDay.entries || []) byId.set(e.id, preferEntry(byId.get(e.id), e));
     days[date] = {
       ...remoteDay,
       ...localDay,

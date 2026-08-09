@@ -62,20 +62,47 @@ export function rideKcal(avgWatts, minutes) {
   return avgWatts * (minutes / 60) * 3.6;
 }
 
+/** Resting burn per minute, from BMR. */
+export function restingKcalPerMin(kg, athlete) {
+  return bmr(kg, athlete.height_cm, athlete.age) / 1440;
+}
+
 /**
- * Exercise kcal for a date. Prefers measured power; falls back to the device's own
- * calorie figure, then to a flat estimate for strength work.
+ * Exercise kcal for a date, NET of the resting burn already counted in base TDEE.
+ *
+ * Two corrections over the naive version:
+ *
+ * 1. Base TDEE covers all twenty-four hours, so adding the gross cost of a session on top
+ *    counts the resting burn for those hours twice — about 230 kcal on a three-hour ride.
+ *    That inflates TDEE, which inflates the apparent deficit. Subtracting it is the
+ *    conservative direction and this page exists to refuse the flattering error.
+ *
+ * 2. Strength work was a flat 200 kcal whatever its length, so a 25-minute session and a
+ *    75-minute one scored identically. Now it scales with duration off a MET value. The
+ *    default 4.0 is the low end of the resistance-training range because a Speediance
+ *    session is a lot of rest between sets — it lands near the old 200 for a typical
+ *    session and only diverges at the extremes, which is exactly the point.
+ *
+ * `kg` is optional: without it the resting correction is skipped and strength falls back
+ * to the flat figure, so callers with no weigh-in still get a usable number.
  */
-export function activityKcal(workouts, athlete) {
+export function activityKcal(workouts, athlete, kg = null) {
+  const restPerMin = kg ? restingKcalPerMin(kg, athlete) : 0;
   let total = 0;
   for (const w of workouts || []) {
+    const min = w.duration_min || 0;
+    let gross = 0;
     if (w.type === 'strength') {
-      total += athlete.strength_kcal ?? 200;
-    } else if (w.avg_watts && w.duration_min) {
-      total += rideKcal(w.avg_watts, w.duration_min);
+      gross = min && kg
+        ? ((athlete.strength_met ?? 4.0) * 3.5 * kg / 200) * min
+        : (athlete.strength_kcal ?? 200);
+    } else if (w.avg_watts && min) {
+      gross = rideKcal(w.avg_watts, min);
     } else if (w.calories) {
-      total += w.calories;
+      gross = w.calories;
     }
+    if (!gross) continue;
+    total += Math.max(0, gross - restPerMin * min);
   }
   return Math.round(total);
 }
@@ -150,7 +177,7 @@ export function targetsFor(iso, { athlete, weights, workouts, planned }) {
   const dayPlanned = (planned || []).filter((x) => x.date === iso);
 
   const base = kg ? baseTDEE(kg, athlete) : null;
-  const act = activityKcal(dayWorkouts, athlete);
+  const act = activityKcal(dayWorkouts, athlete, kg);
   const tdee = base == null ? null : Math.round(base + act);
   const deficit = athlete.planned_deficit_kcal ?? 0;
 
@@ -301,14 +328,34 @@ export function cumulativeDeficit(dates, ctx, logs, openDate = null) {
   };
 }
 
-export function weekDates(iso) {
+/**
+ * The days of the week containing `iso`, up to and including `upTo`.
+ *
+ * `upTo` must be the real today, not the day being viewed. Capping at the viewed day turns
+ * a finished week into a three-day week whenever he pages back, which silently understates
+ * the headline deficit for every historical date.
+ */
+export function weekDates(iso, upTo = iso) {
   const start = weekStart(iso);
   const out = [];
   for (let i = 0; i < 7; i++) {
     const d = addDays(start, i);
-    if (d <= iso) out.push(d);
+    if (d <= upTo) out.push(d);
   }
   return out;
+}
+
+/**
+ * Value at `p` through a series, linearly interpolated. Used to scale charts to the bulk
+ * of the data rather than to its single largest point.
+ */
+export function percentile(values, p) {
+  const v = [...values].filter((n) => Number.isFinite(n)).sort((a, b) => a - b);
+  if (!v.length) return 0;
+  const i = (v.length - 1) * p;
+  const lo = Math.floor(i);
+  const hi = Math.ceil(i);
+  return lo === hi ? v[lo] : v[lo] + (v[hi] - v[lo]) * (i - lo);
 }
 
 // ---------- weight trend ----------
