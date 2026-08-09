@@ -203,11 +203,42 @@ export async function peekJSON(path) {
   if (!res.ok) {
     // A null here is indistinguishable from "file missing" to the caller, and a 403 from
     // the secondary rate limiter looks exactly like a token problem. Record which it was.
-    dbg(`peek ${path}: HTTP ${res.status}${res.status === 403 ? ` (ratelimit-remaining ${res.headers.get('x-ratelimit-remaining')})` : ''}`);
+    if (res.status === 403 && (res.headers.get('retry-after') || res.headers.get('x-ratelimit-remaining') === '0')) noteRateLimit(res);
+    dbg(`peek ${path}: HTTP ${res.status}${res.status === 403 ? ` (ratelimit-remaining ${res.headers.get('x-ratelimit-remaining')}, clears ~${new Date(rateLimitedUntil()).toLocaleTimeString()})` : ''}`);
     return null;
   }
+  clearRateLimit();
   const meta = await res.json();
   return { value: JSON.parse(b64decode(meta.content)), sha: meta.sha };
+}
+
+// ---------- rate limiting ----------
+//
+// GitHub's SECONDARY (abuse) limiter is per account, shared by every device and script
+// using it, and reports itself in the same words as the hourly quota while the hourly
+// quota sits untouched. When it bites, every read 403s for ~10 minutes, and continuing
+// to hammer it extends the ban. The app needs to know it is in that state so the
+// watcher can back off and the sync bar can say what is actually happening.
+
+let rateLimitUntil = 0;
+
+function noteRateLimit(res) {
+  const retryAfter = Number(res.headers.get('retry-after') || 0);
+  const reset = Number(res.headers.get('x-ratelimit-reset') || 0) * 1000;
+  // Secondary limits send retry-after; the hourly quota sends a reset stamp. With
+  // neither visible (CORS can hide them), assume the ~10 minutes observed in practice.
+  rateLimitUntil = retryAfter ? Date.now() + retryAfter * 1000
+    : reset > Date.now() ? reset
+    : Date.now() + 10 * 60 * 1000;
+}
+
+function clearRateLimit() {
+  rateLimitUntil = 0;
+}
+
+/** Epoch ms until which GitHub is refusing this account's reads, or 0 if it isn't. */
+export function rateLimitedUntil() {
+  return rateLimitUntil > Date.now() ? rateLimitUntil : 0;
 }
 
 /** Accept a peeked copy into the cache. Only call this with no writes queued. */
@@ -301,7 +332,17 @@ export async function flushQueue(onMerge) {
 
       if (!res.ok) {
         let why = `GitHub ${res.status}`;
-        if (res.status === 403) why = 'GitHub refused the write (403) — the token is probably read-only or expired';
+        if (res.status === 403) {
+          // A rate-limited 403 and a dead-token 403 need opposite advice: one says wait,
+          // the other says go re-issue the token. Don't send him to GitHub settings for
+          // a limiter that clears itself in ten minutes.
+          if (res.headers.get('retry-after') || res.headers.get('x-ratelimit-remaining') === '0') {
+            noteRateLimit(res);
+            why = 'GitHub is rate-limiting this account — the write is safe on this device and will retry';
+          } else {
+            why = 'GitHub refused the write (403) — the token is probably read-only or expired';
+          }
+        }
         if (res.status === 404) why = 'GitHub returned 404 — the token has lost access to fuel-data';
         if (res.status === 401) why = 'Token rejected (401) — it has expired or been revoked';
         throw new Error(why);

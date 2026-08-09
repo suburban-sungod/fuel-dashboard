@@ -227,6 +227,14 @@ function renderSyncBar() {
     bar.hidden = false;
     bar.className = 'sync-bar failed';
     bar.textContent = `${p} ${p === 1 ? 'change is' : 'changes are'} stuck on this phone and not reaching GitHub — ${stuck.lastError}`;
+  } else if (S.rateLimitedUntil()) {
+    // The one state where a spinner genuinely has to wait. Say so, with a clock — the
+    // alternative is him watching "estimating" while GitHub refuses every read and the
+    // app looks broken. Everything is safe: writes retry, and parsed macros land when
+    // the limiter lifts.
+    bar.hidden = false;
+    bar.className = 'sync-bar pending';
+    bar.textContent = `GitHub is rate-limiting this account (all devices share it) — retrying until ~${new Date(S.rateLimitedUntil()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Everything logged is safe.`;
   } else if (p) {
     bar.hidden = false;
     bar.className = 'sync-bar pending';
@@ -1064,8 +1072,8 @@ function stopWatch() {
   parseTimer = null;
 }
 
-function reschedule() {
-  parseTimer = setTimeout(parseTick, PARSE_TICK_MS);
+function reschedule(ms = PARSE_TICK_MS) {
+  parseTimer = setTimeout(parseTick, ms);
 }
 
 // The tick must be impossible to kill. It used to have try/catch only around the fetch;
@@ -1123,6 +1131,22 @@ async function parseTick() {
       if (changed) render();
       return stopWatch();
     }
+
+    // A rate-limited GitHub refuses reads for ~10 minutes, which is longer than the
+    // whole watch window — the first real incident burned all 18 ticks on 403s and then
+    // expired, leaving a spinner over an entry that had been parsed for ages. Refused
+    // reads must not count against the window: hold it open until the limiter clears,
+    // and poll gently, because hammering a secondary limit extends the ban.
+    const limitedUntil = S.rateLimitedUntil();
+    if (limitedUntil) {
+      if (parseDeadline < limitedUntil) {
+        S.dbg(`parse tick: rate-limited, backing off to 60s ticks until ~${new Date(limitedUntil).toLocaleTimeString()}`);
+        parseDeadline = limitedUntil + PARSE_WINDOW_MS;
+      }
+      render();
+      return reschedule(60000);
+    }
+
     // Re-render even when nothing arrived, so the "still estimating after Ns" counter is
     // honest about how long he has actually been waiting.
     render();
