@@ -107,9 +107,54 @@ export function activityKcal(workouts, athlete, kg = null) {
   return Math.round(total);
 }
 
-/** How much of an activity figure is a real measurement vs a fallback guess. */
-export function activityConfidence(workouts) {
-  if (!workouts || !workouts.length) return 'none';
+/**
+ * Estimated kcal for a PLANNED session, used only where nothing measured exists yet.
+ *
+ * Without this, a day is credited zero activity until Strava syncs — so a three-hour ride
+ * finished at 10am reads as a rest day until 21:00, handing back a rest-day calorie target
+ * and an enormous phantom deficit. The plan is worse than a measurement and better than
+ * pretending the session never happened.
+ *
+ * Deliberately conservative: overstating the plan tells him to eat more than he earned.
+ */
+export function plannedKcal(planned, athlete, kg = null) {
+  const restPerMin = kg ? restingKcalPerMin(kg, athlete) : 0;
+  let total = 0;
+  for (const p of planned || []) {
+    const min = p.duration_min || 0;
+    if (!min) continue;
+    let gross = 0;
+    if (p.type === 'strength') {
+      gross = kg ? ((athlete.strength_met ?? 4.0) * 3.5 * kg / 200) * min : (athlete.strength_kcal ?? 200);
+    } else if (p.type === 'swim') {
+      gross = kg ? ((athlete.swim_met ?? 7.0) * 3.5 * kg / 200) * min : 0;
+    } else if (p.type === 'cycling' && athlete.ftp) {
+      // Prefer the coach's own number: TSS 100 is an hour at FTP, so kcal ≈ TSS/100 × FTP × 3.6.
+      // Untargeted rides ("Gravel or road ride") carry no IF or TSS, so fall back to a low
+      // endurance intensity rather than assuming he rides them hard.
+      gross = p.tss
+        ? (p.tss / 100) * athlete.ftp * 3.6
+        : rideKcal((p.if || athlete.planned_default_if || 0.6) * athlete.ftp, min);
+    }
+    if (!gross) continue;
+    total += Math.max(0, gross - restPerMin * min);
+  }
+  return Math.round(total);
+}
+
+/**
+ * Planned sessions of a type he has no measured session for that day. A planned ride with
+ * a completed ride against it is assumed to BE that ride, not a second one.
+ */
+export function unmatchedPlanned(workouts, planned) {
+  const done = new Set((workouts || []).map((w) => w.type));
+  return (planned || []).filter((p) => !done.has(p.type));
+}
+
+/** How much of an activity figure is a real measurement vs a plan vs a fallback guess. */
+export function activityConfidence(workouts, plannedKcalValue = 0) {
+  if (!workouts || !workouts.length) return plannedKcalValue ? 'planned' : 'none';
+  if (plannedKcalValue) return 'part-planned';
   if (workouts.every((w) => w.type === 'strength')) return 'estimated';
   return workouts.some((w) => w.avg_watts) ? 'measured' : 'estimated';
 }
@@ -177,7 +222,10 @@ export function targetsFor(iso, { athlete, weights, workouts, planned }) {
   const dayPlanned = (planned || []).filter((x) => x.date === iso);
 
   const base = kg ? baseTDEE(kg, athlete) : null;
-  const act = activityKcal(dayWorkouts, athlete, kg);
+  const measuredKcal = activityKcal(dayWorkouts, athlete, kg);
+  const stillPlanned = unmatchedPlanned(dayWorkouts, dayPlanned);
+  const plannedOnly = plannedKcal(stillPlanned, athlete, kg);
+  const act = measuredKcal + plannedOnly;
   const tdee = base == null ? null : Math.round(base + act);
   const deficit = athlete.planned_deficit_kcal ?? 0;
 
@@ -192,7 +240,10 @@ export function targetsFor(iso, { athlete, weights, workouts, planned }) {
     bmr: kg ? Math.round(bmr(kg, athlete.height_cm, athlete.age)) : null,
     base_tdee: base == null ? null : Math.round(base),
     activity_kcal: act,
-    activity_confidence: activityConfidence(dayWorkouts),
+    activity_measured_kcal: measuredKcal,
+    activity_planned_kcal: plannedOnly,
+    activity_planned_sessions: stillPlanned,
+    activity_confidence: activityConfidence(dayWorkouts, plannedOnly),
     tdee,
     kcal_target: tdee == null ? null : tdee - deficit,
     planned_deficit: deficit,

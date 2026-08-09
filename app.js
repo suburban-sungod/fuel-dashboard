@@ -397,7 +397,15 @@ function renderFlags(t, tot) {
     }
   }
 
-  if (t.activity_confidence === 'estimated' && t.activity_kcal) {
+  // Say where the activity number came from. A planned session standing in for one Strava
+  // has not synced yet is the difference between a 3,100 target and an 1,875 one, and he
+  // should never have to guess which he is looking at.
+  if (t.activity_planned_kcal) {
+    const names = t.activity_planned_sessions.map((p) => p.title).filter(Boolean).join(', ');
+    add('warn', `<b>${num(t.activity_planned_kcal)} kcal of today's activity is from the plan, not measured.</b>
+      ${names ? escapeHtml(names) + ' — n' : 'N'}ot in Strava yet. The Mac syncs at 06:15 and 21:00, so a morning
+      session shows as planned until tonight. The number will firm up on its own.`);
+  } else if (t.activity_confidence === 'estimated' && t.activity_kcal) {
     add('', `<b>${num(t.activity_kcal)} kcal activity is estimated,</b> not measured — no power data for this session.`);
   }
 }
@@ -470,8 +478,23 @@ function renderPlan() {
   const plan = t.planned.filter((p) => !['strength', 'swim', 'other'].includes(p.type));
   const ride = src[0] || plan[0];
 
+  // Today's sessions by name. Without this the TrainingPeaks and Strava data drove the
+  // numbers invisibly, so a synced plan was indistinguishable from nothing having synced.
+  const sessions = [
+    ...t.workouts.map((w) => ({ name: w.name, min: w.duration_min, tag: w.avg_watts ? `${Math.round(w.avg_watts)}W avg` : 'no power', done: true })),
+    ...t.activity_planned_sessions.map((p) => ({ name: p.title, min: p.duration_min, tag: p.tss ? `TSS ${p.tss} planned` : 'planned', done: false })),
+  ];
+  if (sessions.length) {
+    line(`<span><b>Today:</b> ${sessions.map((s) =>
+      `${escapeHtml(s.name || 'Session')} · ${s.min}min · ${s.tag}${s.done ? '' : ' <em class="tag">not yet done</em>'}`
+    ).join('<br>')}</span>`);
+  }
+
   if (t.kcal_target) {
-    line(`<span><b>${num(t.kcal_target)} kcal</b> target — ${num(t.base_tdee)} base + ${num(t.activity_kcal)} activity − ${num(t.planned_deficit)} deficit. BMR ${num(t.bmr)} at ${t.weight_kg}kg.</span>`);
+    const split = t.activity_planned_kcal
+      ? `${num(t.activity_measured_kcal)} measured + ${num(t.activity_planned_kcal)} planned`
+      : `${num(t.activity_kcal)}`;
+    line(`<span><b>${num(t.kcal_target)} kcal</b> target — ${num(t.base_tdee)} base + ${split} activity − ${num(t.planned_deficit)} deficit. BMR ${num(t.bmr)} at ${t.weight_kg}kg.</span>`);
   }
   if (t.protein_target) {
     line(`<span><b>${t.protein_target}g protein</b> (${state.athlete.protein_g_per_kg}g/kg) across 4–5 doses of ${state.athlete.protein_min_per_meal_g}g+.</span>`);
