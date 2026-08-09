@@ -420,6 +420,25 @@ async function putFile(path, value, message, sha) {
   });
 }
 
+// Retry schedule for a failing write, by attempt count. The queue survives reloads and
+// closed tabs, so nothing is lost by waiting — whereas retrying hard costs the hourly
+// quota, and once that is gone every READ 403s as well and the app cannot even discover
+// that the work it is queuing has already been done by someone else.
+const BACKOFF_MS = [0, 0, 30e3, 2 * 60e3, 5 * 60e3, 15 * 60e3];
+
+function backoffRemaining(job) {
+  const attempts = job.attempts || 0;
+  if (!attempts || !job.lastTry) return 0;
+  const wait = BACKOFF_MS[Math.min(attempts, BACKOFF_MS.length - 1)];
+  return Math.max(0, job.lastTry + wait - Date.now());
+}
+
+/** When the oldest stuck write will next be tried, or 0 if one is due now. */
+export function nextRetryAt() {
+  const waits = getQueue().map((j) => backoffRemaining(j)).filter((ms) => ms > 0);
+  return waits.length === getQueue().length && waits.length ? Date.now() + Math.min(...waits) : 0;
+}
+
 /**
  * Flush the queue. On a sha conflict the remote file is re-read and the local copy
  * re-applied on top, so a write from another device is never silently clobbered.
@@ -427,6 +446,11 @@ async function putFile(path, value, message, sha) {
 export async function flushQueue(onMerge) {
   if (!getToken() || !navigator.onLine) {
     return { flushed: 0, failed: pendingCount(), error: navigator.onLine ? null : 'offline' };
+  }
+  // GitHub is already refusing this account. Spending the attempt anyway extends the ban
+  // and teaches the backoff nothing.
+  if (rateLimitedUntil()) {
+    return { flushed: 0, failed: pendingCount(), error: 'GitHub is rate-limiting this account — the write is safe on this device and will retry' };
   }
   let flushed = 0;
   let failed = 0;
@@ -438,6 +462,11 @@ export async function flushQueue(onMerge) {
   for (const job of getQueue()) {
     const cached = cacheGet(job.path);
     if (!cached) continue;
+    // A write that has failed repeatedly gets retried more slowly. Retrying every 60s,
+    // plus on every focus and every visibilitychange, from however many tabs are open,
+    // is how a single stuck write burned an entire hourly quota to zero — after which
+    // every read 403s too and nothing can recover. The queue is durable; it can wait.
+    if (backoffRemaining(job) > 0) { failed++; continue; }
     try {
       // What we actually sent. On a merge this stops being the local copy, and the cache
       // has to end up holding the merged result — caching the pre-merge copy against the
@@ -455,13 +484,37 @@ export async function flushQueue(onMerge) {
           const meta = await fresh.json();
           const remote = JSON.parse(b64decode(meta.content));
           sent = onMerge ? onMerge(job.path, remote, cached.value) : cached.value;
+
+          // The merge changed nothing, so this write has nothing left to say. Almost
+          // always it is a phone holding pending copies of entries the parser has already
+          // resolved on GitHub: the queued write is fighting for the right to publish
+          // worse data, and losing, forever. Take the remote copy and drop the job.
+          if (JSON.stringify(sent) === JSON.stringify(remote)) {
+            cacheSet(job.path, remote, meta.sha);
+            dequeue(job.path);
+            flushed++;
+            dbg(`write ${job.path}: already on GitHub, nothing left to send — dropped`);
+            continue;
+          }
+
           cacheSet(job.path, sent, meta.sha);
           res = await putFile(job.path, sent, job.message + ' (merged)', meta.sha);
+        } else {
+          // Without this the caller sees the ORIGINAL 409 and is told the write conflicted,
+          // when in fact the app never managed to read the file it was conflicting with.
+          // Those need opposite responses and looked identical for three debugging sessions.
+          if (fresh.status === 403 && (fresh.headers.get('retry-after') || fresh.headers.get('x-ratelimit-remaining') === '0')) noteRateLimit(fresh);
+          throw new Error(`conflict, and the re-read failed too (GitHub ${fresh.status})`);
         }
       }
 
       if (!res.ok) {
-        let why = `GitHub ${res.status}`;
+        // GitHub says exactly what is wrong in the body and we were throwing it away, so
+        // every write failure arrived as a bare status code and three separate debugging
+        // sessions had to guess. Never again.
+        let detail = '';
+        try { detail = (await res.json())?.message || ''; } catch { /* body may be empty */ }
+        let why = `GitHub ${res.status}${detail ? ` — ${detail}` : ''}`;
         if (res.status === 403) {
           // A rate-limited 403 and a dead-token 403 need opposite advice: one says wait,
           // the other says go re-issue the token. Don't send him to GitHub settings for
@@ -497,7 +550,7 @@ export async function flushQueue(onMerge) {
 /** Record that a queued write was tried and failed, so the UI can stop calling it "waiting". */
 function markAttempt(path, message) {
   const q = getQueue().map((j) =>
-    j.path === path ? { ...j, attempts: (j.attempts || 0) + 1, lastError: message } : j
+    j.path === path ? { ...j, attempts: (j.attempts || 0) + 1, lastError: message, lastTry: Date.now() } : j
   );
   localStorage.setItem(LS.queue, JSON.stringify(q));
 }
@@ -505,6 +558,15 @@ function markAttempt(path, message) {
 /** The oldest stuck write, if any write has now failed more than once. */
 export function stuckWrite() {
   return getQueue().find((j) => (j.attempts || 0) >= 2) || null;
+}
+
+/**
+ * Abandon a queued write. Only for the case where the remote copy already contains
+ * everything the queued one was trying to say — see the merge check in `flushQueue`.
+ */
+export function discardWrite(path) {
+  dequeue(path);
+  dbg(`write ${path}: discarded, GitHub already has this content`);
 }
 
 function dequeue(path) {

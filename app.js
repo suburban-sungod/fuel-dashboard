@@ -245,7 +245,10 @@ function renderSyncBar() {
     // it is stuck, and he needs to know his food log is only on this phone.
     bar.hidden = false;
     bar.className = 'sync-bar failed';
-    bar.textContent = `${p} ${p === 1 ? 'change is' : 'changes are'} stuck on this phone and not reaching GitHub — ${stuck.lastError}`;
+    const next = S.nextRetryAt();
+    bar.textContent = `${p} ${p === 1 ? 'change is' : 'changes are'} stuck on this phone and not reaching GitHub — ${stuck.lastError}.`
+      + (next ? ` Retrying ~${new Date(next).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.` : '')
+      + ' Tap to read GitHub anyway.';
   } else if (S.rateLimitedUntil()) {
     // The one state where a spinner genuinely has to wait. Say so, with a clock — the
     // alternative is him watching "estimating" while GitHub refuses every read and the
@@ -1245,9 +1248,23 @@ async function parseTick() {
 
     // A queued write means the entry has not reached GitHub yet, so there is nothing to
     // find. Hold the deadline open rather than spending the window waiting on ourselves.
+    //
+    // A STUCK write is the opposite situation and this used to treat them the same: it
+    // held the window open indefinitely, logging the same line every five seconds for
+    // sixteen hours, while the answer sat on GitHub the whole time. Hand those to
+    // refreshData, which reads past a stuck write and merges.
     if (S.pendingCount()) {
-      S.dbg(`parse tick: ${S.pendingCount()} write(s) still queued, holding window open`);
-      parseDeadline = Date.now() + PARSE_WINDOW_MS;
+      if (!S.stuckWrite()) {
+        S.dbg(`parse tick: ${S.pendingCount()} write(s) still queued, holding window open`);
+        parseDeadline = Date.now() + PARSE_WINDOW_MS;
+        return reschedule();
+      }
+      S.dbg(`parse tick: ${S.pendingCount()} write(s) stuck — reading GitHub anyway`);
+      if (await refreshData({ force: true })) render();
+      if (!datesAwaitingParse().length) {
+        S.dbg('parse tick: resolved from GitHub despite the stuck write, stopping watch');
+        return stopWatch();
+      }
       return reschedule();
     }
 
@@ -1374,11 +1391,23 @@ async function recheckNow() {
 
 async function refreshData({ force = false } = {}) {
   if (!force && Date.now() - lastRefresh < REFRESH_MIN_GAP_MS) return false;
-  // Never read over the top of a write that has not been sent yet.
-  if (S.pendingCount()) {
+
+  // A queued write normally blocks reads: adopting the remote copy over the top of an
+  // entry that has not been sent yet would lose it, and the queued job would then push
+  // the clobbered file back.
+  //
+  // But a write that has failed repeatedly is not "not sent yet", it is stuck — and
+  // blocking reads on it means the app can sit for sixteen hours showing spinners for
+  // entries GitHub has already parsed, unable even to look. That happened. So once a
+  // write is stuck we do read, and MERGE rather than adopt, which keeps the unsent work
+  // and picks up everything else. The merge also repairs the queued write: it comes back
+  // holding the current sha, which is usually what unsticks it.
+  const stuck = !!S.stuckWrite();
+  if (S.pendingCount() && !stuck) {
     if (force) S.dbg(`refresh skipped: ${S.pendingCount()} write(s) still queued`);
     return false;
   }
+  if (stuck) S.dbg(`refresh: reading despite ${S.pendingCount()} stuck write(s), will merge`);
   lastRefresh = Date.now();
 
   const monthKeys = new Set([state.date.slice(0, 7), F.isoDate(new Date()).slice(0, 7)]);
@@ -1388,11 +1417,22 @@ async function refreshData({ force = false } = {}) {
     const path = S.paths.month(m + '-01');
     let got;
     try { got = await S.peekJSON(path); } catch { continue; }
-    if (!got || S.pendingCount()) continue;      // a write landed mid-fetch — leave it alone
-    if (JSON.stringify(state.months[m]) === JSON.stringify(got.value)) continue;
-    S.adopt(path, got.value, got.sha);
-    state.months[m] = got.value;
-    for (const [d, day] of Object.entries(got.value.days || {})) {
+    if (!got) continue;
+    // A write landed mid-fetch — leave it alone. Unless it is the stuck one we already
+    // decided to read past, which is still queued by definition.
+    if (S.pendingCount() && !stuck) continue;
+
+    const next = stuck ? S.mergeMonth(path, got.value, state.months[m]) : got.value;
+    if (stuck && JSON.stringify(next) === JSON.stringify(got.value)) {
+      // Everything the stuck write wanted to say is already on GitHub. Almost always this
+      // is pending entries the parser has since resolved: the queued job has been fighting
+      // to replace good data with worse. Let it go.
+      S.discardWrite(path);
+    }
+    if (JSON.stringify(state.months[m]) === JSON.stringify(next)) continue;
+    S.adopt(path, next, got.sha);
+    state.months[m] = next;
+    for (const [d, day] of Object.entries(next.days || {})) {
       state.logs[d] = { date: d, entries: [], confounders: [], notes: '', ...day };
     }
     changed = true;
@@ -1400,7 +1440,7 @@ async function refreshData({ force = false } = {}) {
 
   try {
     const w = await S.peekJSON(S.paths.weight);
-    if (w && !S.pendingCount() && JSON.stringify(w.value) !== JSON.stringify(state.weights)) {
+    if (w && (!S.pendingCount() || stuck) && JSON.stringify(w.value) !== JSON.stringify(state.weights)) {
       S.adopt(S.paths.weight, w.value, w.sha);
       state.weights = w.value;
       changed = true;
