@@ -53,7 +53,7 @@ async function boot() {
 
   // A desktop tab can sit focused for hours without a single visibilitychange, so focus
   // alone is not enough — poll gently while the window is actually being looked at.
-  readBuildTag().then((t) => { buildTag = t; });
+  readBuildTag().then((t) => { buildTag = t; S.dbg(`boot: build ${t || 'unknown'}, ${S.pendingCount()} queued`); });
   setInterval(async () => {
     if (document.hidden) return;
     if (await checkForNewBuild()) return;
@@ -478,7 +478,7 @@ function renderEntries() {
       // fix a time, and on a failed parse it meant retyping the food itself.
       const main = row.querySelector('.e-main');
       main.onclick = (ev) => {
-        if (ev.target.classList.contains('recheck')) { refreshData({ force: true }); return; }
+        if (ev.target.classList.contains('recheck')) { recheckNow(); return; }
         openSheet(e);
       };
       main.style.cursor = 'pointer';
@@ -864,7 +864,24 @@ function renderSettings() {
       <li>Goal <span>${a.goal_weight_kg}kg</span></li>
       <li>Pending writes <span>${S.pendingCount()}</span></li>
     </div>
+    <h3 style="margin-top:18px">Diagnostics</h3>
+    <p class="muted small">What the sync machinery has actually done on this device — writes, reads,
+    the parse watcher, errors. Newest first. If an entry ever gets stuck estimating again, this is
+    the evidence: copy it before reloading.</p>
+    <pre id="debug-log" class="small" style="max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:var(--card,rgba(128,128,128,.08));border-radius:8px;padding:10px;font-size:11px;line-height:1.5">${escapeHtml([...S.dbgLines()].reverse().join('\n') || 'Nothing recorded yet.')}</pre>
+    <button id="copy-debug" class="link-btn">Copy diagnostics</button>
     <button id="signout" class="btn-primary" style="margin-top:14px;background:var(--bad)">Remove token from this device</button>`;
+  $('#copy-debug').onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(S.dbgLines().join('\n'));
+      $('#copy-debug').textContent = 'Copied';
+      setTimeout(() => { const b = $('#copy-debug'); if (b) b.textContent = 'Copy diagnostics'; }, 1500);
+    } catch {
+      // Clipboard needs a secure context and a user gesture; if it refuses, the text is
+      // right there in the box to select by hand.
+      $('#copy-debug').textContent = 'Copy failed — select the text above';
+    }
+  };
   $('#signout').onclick = () => {
     // Say what actually goes. This wipes the local copy of the log, not just the token.
     const unsynced = S.unsyncedSummary();
@@ -1001,7 +1018,7 @@ function addCustom() {
 
   ['#c-label', '#c-kcal', '#c-protein', '#c-carbs', '#c-fat'].forEach((s) => ($(s).value = ''));
   closeSheet();
-  if (entry.source === 'freetext') watchForParse();
+  if (entry.source === 'freetext') { S.dbg(`freetext entry ${entry.id} queued for parse`); watchForParse(); }
 }
 
 // ---------- waiting on the parser ----------
@@ -1016,6 +1033,8 @@ const PARSE_WINDOW_MS = 90000;
 const PARSE_TICK_MS = 5000;
 let parseTimer = null;
 let parseDeadline = 0;
+let tickInFlight = false;
+let lastTickAt = 0;
 
 /** Every loaded day still holding an entry the parser hasn't resolved. */
 function datesAwaitingParse() {
@@ -1031,7 +1050,13 @@ function datesAwaitingParse() {
 function watchForParse(restart = true) {
   if (!datesAwaitingParse().length) return stopWatch();
   if (restart) parseDeadline = Date.now() + PARSE_WINDOW_MS;
-  if (!parseTimer) parseTimer = setTimeout(parseTick, PARSE_TICK_MS);
+  // A tick that is mid-await holds no timer, so without the in-flight check a restart
+  // here would fork a second tick chain that then polls alongside the first forever.
+  // The running tick always reschedules itself; extending the deadline is enough.
+  if (!parseTimer && !tickInFlight) {
+    lastTickAt = Date.now();
+    parseTimer = setTimeout(parseTick, PARSE_TICK_MS);
+  }
 }
 
 function stopWatch() {
@@ -1043,41 +1068,72 @@ function reschedule() {
   parseTimer = setTimeout(parseTick, PARSE_TICK_MS);
 }
 
+// The tick must be impossible to kill. It used to have try/catch only around the fetch;
+// anything else throwing — adopt, render, a data shape the UI chokes on — ended the
+// chain with no reschedule, no error anywhere, and a spinner that spins until the app is
+// reloaded. That is exactly the reported symptom, so now the whole body is guarded and
+// every exit is recorded.
 async function parseTick() {
   parseTimer = null;
-  if (!datesAwaitingParse().length) return;
+  tickInFlight = true;
+  try {
+    // Direct evidence for the timer-throttling theory: a browser clamping this timer to
+    // once a minute shows up here as a gap, where a dead watcher shows up as nothing.
+    const gap = Date.now() - lastTickAt;
+    if (gap > PARSE_TICK_MS * 3) S.dbg(`parse tick: ran ${Math.round(gap / 1000)}s after the last one — timer throttled?`);
+    lastTickAt = Date.now();
 
-  // A queued write means the entry has not reached GitHub yet, so there is nothing to
-  // find. Hold the deadline open rather than spending the window waiting on ourselves.
-  if (S.pendingCount()) {
-    parseDeadline = Date.now() + PARSE_WINDOW_MS;
-    return reschedule();
-  }
+    if (!datesAwaitingParse().length) return;
 
-  let changed = false;
-  for (const m of new Set(datesAwaitingParse().map((d) => d.slice(0, 7)))) {
-    const path = S.paths.month(m + '-01');
-    let got;
-    try { got = await S.peekJSON(path); } catch { continue; }
-    if (!got) continue;
-
-    // A write queued while that fetch was in flight makes the response stale the instant
-    // it arrives. Adopting it would overwrite the entry just logged, and the queued job
-    // would then push the overwritten file. Drop it and come back next tick.
-    if (S.pendingCount()) return reschedule();
-
-    S.adopt(path, got.value, got.sha);
-    state.months[m] = got.value;
-    for (const [d, day] of Object.entries(got.value.days || {})) {
-      state.logs[d] = { date: d, entries: [], confounders: [], notes: '', ...day };
+    // A queued write means the entry has not reached GitHub yet, so there is nothing to
+    // find. Hold the deadline open rather than spending the window waiting on ourselves.
+    if (S.pendingCount()) {
+      S.dbg(`parse tick: ${S.pendingCount()} write(s) still queued, holding window open`);
+      parseDeadline = Date.now() + PARSE_WINDOW_MS;
+      return reschedule();
     }
-    changed = true;
+
+    let changed = false;
+    for (const m of new Set(datesAwaitingParse().map((d) => d.slice(0, 7)))) {
+      const path = S.paths.month(m + '-01');
+      let got;
+      try { got = await S.peekJSON(path); } catch (e) { S.dbg(`parse tick: peek ${path} threw — ${e?.message || e}`); continue; }
+      if (!got) continue;
+
+      // A write queued while that fetch was in flight makes the response stale the instant
+      // it arrives. Adopting it would overwrite the entry just logged, and the queued job
+      // would then push the overwritten file. Drop it and come back next tick.
+      if (S.pendingCount()) return reschedule();
+
+      // Only worth a log line when the file actually moved — that one line separates
+      // "the watcher polled and GitHub kept serving the pre-parse copy" from "the
+      // watcher never looked at all", which no amount of repo archaeology could do.
+      const before = S.cachedSha(path);
+      if (got.sha !== before) S.dbg(`parse tick: ${path} changed ${String(before).slice(0, 7)} → ${got.sha.slice(0, 7)}, adopting`);
+
+      S.adopt(path, got.value, got.sha);
+      state.months[m] = got.value;
+      for (const [d, day] of Object.entries(got.value.days || {})) {
+        state.logs[d] = { date: d, entries: [], confounders: [], notes: '', ...day };
+      }
+      changed = true;
+    }
+    if (!datesAwaitingParse().length) {
+      S.dbg('parse tick: resolved, stopping watch');
+      if (changed) render();
+      return stopWatch();
+    }
+    // Re-render even when nothing arrived, so the "still estimating after Ns" counter is
+    // honest about how long he has actually been waiting.
+    render();
+    if (Date.now() < parseDeadline) reschedule();
+    else S.dbg('parse tick: window expired with entries still pending');
+  } catch (e) {
+    S.dbg(`parse tick: THREW — ${e?.message || e}`);
+    if (datesAwaitingParse().length && Date.now() < parseDeadline) reschedule();
+  } finally {
+    tickInFlight = false;
   }
-  if (!datesAwaitingParse().length) { if (changed) render(); return stopWatch(); }
-  // Re-render even when nothing arrived, so the "still estimating after Ns" counter is
-  // honest about how long he has actually been waiting.
-  render();
-  if (Date.now() < parseDeadline) reschedule();
 }
 
 // ---------- staying current with the deployed build ----------
@@ -1106,7 +1162,11 @@ async function checkForNewBuild() {
   if (!tag || !buildTag || tag === buildTag) return false;
   // Never reload out from under an unsent write or a half-typed entry. The queue survives
   // a reload, but losing what he is mid-way through typing would be its own bug.
-  if (S.pendingCount() || !$('#sheet').hidden) return false;
+  if (S.pendingCount() || !$('#sheet').hidden) {
+    S.dbg(`new build ${tag} seen but not reloading (queue or sheet open)`);
+    return false;
+  }
+  S.dbg(`new build ${tag} (was ${buildTag}), reloading`);
   location.reload();
   return true;
 }
@@ -1126,10 +1186,25 @@ async function checkForNewBuild() {
 const REFRESH_MIN_GAP_MS = 60000;
 let lastRefresh = 0;
 
+/**
+ * The "check now" tap on a stuck row. `refreshData` alone refuses to read while a write
+ * is queued — correct in general, but it made the one button offered to an anxious user
+ * a silent no-op exactly when a stuck write was the problem. Flush first, then read.
+ */
+async function recheckNow() {
+  S.dbg(`recheck tapped (${S.pendingCount()} queued)`);
+  await flush();
+  await refreshData({ force: true });
+  watchForParse(true);
+}
+
 async function refreshData({ force = false } = {}) {
   if (!force && Date.now() - lastRefresh < REFRESH_MIN_GAP_MS) return false;
   // Never read over the top of a write that has not been sent yet.
-  if (S.pendingCount()) return false;
+  if (S.pendingCount()) {
+    if (force) S.dbg(`refresh skipped: ${S.pendingCount()} write(s) still queued`);
+    return false;
+  }
   lastRefresh = Date.now();
 
   const monthKeys = new Set([state.date.slice(0, 7), F.isoDate(new Date()).slice(0, 7)]);
@@ -1158,7 +1233,7 @@ async function refreshData({ force = false } = {}) {
     }
   } catch { /* the log matters more; a stale weight is visible in the UI anyway */ }
 
-  if (changed) render();
+  if (changed) { S.dbg(`refresh: remote changes adopted${force ? ' (forced)' : ''}`); render(); }
   return changed;
 }
 
@@ -1166,12 +1241,27 @@ async function refreshData({ force = false } = {}) {
  * Called when the app comes back to the foreground. Flushes anything the suspended timer
  * failed to send, pulls in whatever another device logged while this one was away, then
  * reopens the parse window.
+ *
+ * `visibilitychange` and `focus` both fire on the same foregrounding, a few ms apart.
+ * Unguarded, that ran two flushes over the same queue concurrently: the second PUT hit a
+ * sha conflict with the first, triggered a pointless merge round-trip, and on a slow
+ * link could keep the queue non-empty long enough to stall the parse watcher.
  */
+let resuming = false;
 async function resume() {
-  if (await checkForNewBuild()) return;   // reloading; nothing else is worth starting
-  await flush();
-  await refreshData();
-  watchForParse(true);
+  if (resuming) return;
+  resuming = true;
+  try {
+    S.dbg(`resume (${document.visibilityState}, ${S.pendingCount()} queued)`);
+    if (await checkForNewBuild()) return;   // reloading; nothing else is worth starting
+    await flush();
+    await refreshData();
+    watchForParse(true);
+  } catch (e) {
+    S.dbg(`resume: THREW — ${e?.message || e}`);
+  } finally {
+    resuming = false;
+  }
 }
 
 /** Reads whichever weigh-in box has a value — Today and Trends both have one. */

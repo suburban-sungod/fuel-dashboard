@@ -11,7 +11,37 @@ const LS = {
   cache: 'fuel.cache.',
   queue: 'fuel.queue',
   lastSync: 'fuel.lastSync',
+  debug: 'fuel.debug',
 };
+
+// ---------- diagnostics ----------
+//
+// Three stuck-spinner incidents were diagnosed entirely from repo state and commit
+// timestamps, because the client kept no record of what it had actually done. This is
+// that record: a small ring buffer in localStorage, written at every point where the
+// sync machinery makes a decision, readable from the Ref tab. It must never throw —
+// a diagnostic that can break the thing it observes is worse than none.
+
+const DEBUG_MAX_LINES = 300;
+
+export function dbg(msg) {
+  try {
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const stamp = `${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+    const buf = JSON.parse(localStorage.getItem(LS.debug) || '[]');
+    buf.push(`${stamp} ${msg}`);
+    localStorage.setItem(LS.debug, JSON.stringify(buf.slice(-DEBUG_MAX_LINES)));
+  } catch { /* never let diagnostics take the app down */ }
+}
+
+export function dbgLines() {
+  try {
+    return JSON.parse(localStorage.getItem(LS.debug) || '[]');
+  } catch {
+    return [];
+  }
+}
 
 // ---------- base64 that survives non-ASCII ----------
 
@@ -56,7 +86,7 @@ export function clearToken() {
   }
   const dropped = pendingCount();
   cacheKeys.forEach((k) => localStorage.removeItem(k));
-  [LS.token, LS.queue, LS.lastSync].forEach((k) => localStorage.removeItem(k));
+  [LS.token, LS.queue, LS.lastSync, LS.debug].forEach((k) => localStorage.removeItem(k));
   return { cachedFiles: cacheKeys.length, unsyncedWrites: dropped };
 }
 
@@ -170,7 +200,12 @@ export async function peekJSON(path) {
     headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' },
     cache: 'no-store',
   });
-  if (!res.ok) return null;
+  if (!res.ok) {
+    // A null here is indistinguishable from "file missing" to the caller, and a 403 from
+    // the secondary rate limiter looks exactly like a token problem. Record which it was.
+    dbg(`peek ${path}: HTTP ${res.status}${res.status === 403 ? ` (ratelimit-remaining ${res.headers.get('x-ratelimit-remaining')})` : ''}`);
+    return null;
+  }
   const meta = await res.json();
   return { value: JSON.parse(b64decode(meta.content)), sha: meta.sha };
 }
@@ -250,6 +285,7 @@ export async function flushQueue(onMerge) {
       let res = await putFile(job.path, sent, job.message, cached.sha);
 
       if (res.status === 409 || res.status === 422) {
+        dbg(`write ${job.path}: sha conflict (${res.status}), re-reading and merging`);
         const fresh = await fetch(`${API}/repos/${OWNER}/${REPO}/contents/${job.path}`, {
           headers: { Authorization: `Bearer ${getToken()}`, Accept: 'application/vnd.github+json' },
           cache: 'no-store',
@@ -274,10 +310,12 @@ export async function flushQueue(onMerge) {
       cacheSet(job.path, sent, out.content.sha);
       dequeue(job.path);
       flushed++;
+      dbg(`write ${job.path}: flushed ok (queued ${Math.round((Date.now() - job.at) / 1000)}s ago)`);
     } catch (e) {
       failed++;
       error = error || e.message;
       markAttempt(job.path, e.message);
+      dbg(`write ${job.path}: FAILED — ${e.message}`);
     }
   }
 
