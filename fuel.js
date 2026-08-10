@@ -93,9 +93,15 @@ export function activityKcal(workouts, athlete, kg = null) {
     const min = w.duration_min || 0;
     let gross = 0;
     if (w.type === 'strength') {
-      gross = min && kg
-        ? ((athlete.strength_met ?? 4.0) * 3.5 * kg / 200) * min
-        : (athlete.strength_kcal ?? 200);
+      // The Speediance measures the work done, so its figure beats anything modelled here
+      // — the same reason a ride prefers power over the watch's calorie guess. Only a
+      // number marked as measured qualifies: TrainingPeaks also reports calories for a
+      // lift, but derives them from heart rate, which resistance work makes meaningless.
+      gross = w.source === 'speediance' && w.calories
+        ? w.calories
+        : min && kg
+          ? ((athlete.strength_met ?? 4.0) * 3.5 * kg / 200) * min
+          : (athlete.strength_kcal ?? 200);
     } else if (w.avg_watts && min) {
       gross = rideKcal(w.avg_watts, min);
     } else if (w.calories) {
