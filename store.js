@@ -139,7 +139,12 @@ export async function verifyToken(token) {
 // secret: the endpoint is public and useless without the GitHub token the caller presents.
 
 const PARSE_URL = 'https://fuel-parse.shadesofjade.workers.dev/parse';
-const PARSE_TIMEOUT_MS = 10000;
+// Observed round trips: 5.2s, 7.3s, 8.0s, and one that ran past 10s and fell back. The
+// original 10s was set from an assumed 1-2s and left almost no headroom, so an estimate
+// that was on its way got thrown away and the entry went to the slow path instead.
+// Giving up early costs more than waiting: the row sits there either way, but a timeout
+// also spends a GitHub write, a workflow run and a second Anthropic call.
+const PARSE_TIMEOUT_MS = 20000;
 
 /**
  * The parse endpoint, or '' if there isn't one. The localStorage override exists so the
