@@ -313,6 +313,22 @@ async function syncNow() {
   state.planned = res.planned;
   S.queueWrite(S.paths.workouts, res.workouts, 'sync: workouts (from the app)');
   S.queueWrite(S.paths.planned, res.planned, 'sync: planned (from the app)');
+
+  // Weigh-ins from the Garmin scales, by way of TrainingPeaks. Union by date, and
+  // anything already in the log wins: he only ever types a weight to correct one, and a
+  // sync that reverted the correction would be worse than not syncing weight at all.
+  let newWeighIns = 0;
+  if (res.weights?.length) {
+    const byDate = new Map(res.weights.map((w) => [w.date, w]));
+    const before = byDate.size;
+    for (const w of state.weights || []) byDate.set(w.date, w);
+    newWeighIns = before - (state.weights || []).filter((w) => res.weights.some((s) => s.date === w.date)).length;
+    const merged = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+    if (JSON.stringify(merged) !== JSON.stringify(state.weights)) {
+      state.weights = merged;
+      S.queueWrite(S.paths.weight, merged, 'sync: weight (from the app)');
+    }
+  }
   // The staleness warning reads this. Without updating it, a successful sync leaves the
   // app still insisting the training data is days old.
   state.status = {
@@ -327,7 +343,8 @@ async function syncNow() {
 
   const done = res.workouts.filter((w) => w.date === F.isoDate(new Date())).length;
   out.textContent = `${res.workouts.length} workouts, ${res.planned.length} planned`
-    + (done ? ` · ${done} logged today` : ' · nothing recorded today yet');
+    + (done ? ` · ${done} logged today` : ' · nothing recorded today yet')
+    + (newWeighIns > 0 ? ` · ${newWeighIns} new weigh-${newWeighIns === 1 ? 'in' : 'ins'}` : '');
   btn.disabled = false;
   render();
   flush();
