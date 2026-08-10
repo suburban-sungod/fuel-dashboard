@@ -334,9 +334,20 @@ export async function peekJSON(path) {
     // A null here is indistinguishable from "file missing" to the caller, and a 403 from
     // the secondary rate limiter looks exactly like a token problem. Record which it was.
     if (res.status === 403 && (res.headers.get('retry-after') || res.headers.get('x-ratelimit-remaining') === '0')) noteRateLimit(res);
-    dbg(`peek ${path}: HTTP ${res.status}${res.status === 403 ? ` (ratelimit-remaining ${res.headers.get('x-ratelimit-remaining')}, clears ~${new Date(rateLimitedUntil()).toLocaleTimeString()})` : ''}`);
+    // `remaining 0` alone cannot tell the two possible causes apart, and they need
+    // opposite fixes. A LIMIT of 60 means GitHub is treating these reads as anonymous —
+    // the token is not arriving — and no amount of backing off will help. A limit of
+    // 5000 means something really is making thousands of requests an hour on this token.
+    // Log the limit and the resource so the next occurrence answers the question itself.
+    const lim = res.headers.get('x-ratelimit-limit');
+    const used = res.headers.get('x-ratelimit-used');
+    const resource = res.headers.get('x-ratelimit-resource');
+    dbg(`peek ${path}: HTTP ${res.status}${res.status === 403
+      ? ` (used ${used}/${lim} of "${resource}", remaining ${res.headers.get('x-ratelimit-remaining')}, clears ~${new Date(rateLimitedUntil()).toLocaleTimeString()})`
+      : ''}`);
     return null;
   }
+  noteQuota(res, path);
   clearRateLimit();
   const meta = await res.json();
   return { value: JSON.parse(b64decode(meta.content)), sha: meta.sha };
@@ -351,6 +362,29 @@ export async function peekJSON(path) {
 // watcher can back off and the sync bar can say what is actually happening.
 
 let rateLimitUntil = 0;
+
+// What the quota looked like on the last successful read. Logged when it first appears
+// and whenever it gets low, because "remaining 0" on a 403 never said which quota was
+// exhausted — and a LIMIT of 60 (anonymous) versus 5000 (this token) is the whole
+// diagnosis. Cheap: it is reading headers off a response we already have.
+let quotaSeen = null;
+
+function noteQuota(res, path) {
+  const limit = Number(res.headers.get('x-ratelimit-limit') || 0);
+  const remaining = Number(res.headers.get('x-ratelimit-remaining') || 0);
+  if (!limit) return;
+  const first = quotaSeen?.limit !== limit;
+  quotaSeen = { limit, remaining, at: Date.now() };
+  if (first || remaining < 50 || remaining % 500 === 0) {
+    dbg(`quota: ${remaining}/${limit} left on "${res.headers.get('x-ratelimit-resource')}" after reading ${path}`
+      + (limit <= 60 ? ' — a limit this low means GitHub is treating these reads as ANONYMOUS' : ''));
+  }
+}
+
+/** The last seen quota, for the Reference tab. */
+export function quota() {
+  return quotaSeen;
+}
 
 function noteRateLimit(res) {
   const retryAfter = Number(res.headers.get('retry-after') || 0);

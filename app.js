@@ -1496,6 +1496,12 @@ async function refreshData({ force = false } = {}) {
   // write is stuck we do read, and MERGE rather than adopt, which keeps the unsent work
   // and picks up everything else. The merge also repairs the queued write: it comes back
   // holding the current sha, which is usually what unsticks it.
+  // Every read while rate-limited is a request spent on a guaranteed 403. Two of them
+  // every five minutes is nothing against a 5,000/hr quota and a large fraction of a
+  // 60/hr one — and it is exactly the behaviour that keeps a small quota pinned at zero.
+  // A forced tap still goes through: he may have a reason to believe it has cleared.
+  if (!force && S.rateLimitedUntil()) return false;
+
   const stuck = !!S.stuckWrite();
   if (S.pendingCount() && !stuck) {
     if (force) S.dbg(`refresh skipped: ${S.pendingCount()} write(s) still queued`);
