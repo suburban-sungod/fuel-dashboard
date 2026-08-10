@@ -1286,7 +1286,15 @@ async function addCustom() {
 
 const PARSE_WINDOW_MS = 90000;
 const PARSE_TICK_MS = 5000;
+// A hard ceiling on how long one watch can live, however many times its window is
+// extended. Ten thousand API calls in an hour — twice the hourly quota — came from this
+// watcher extending its own deadline every tick while a write sat queued, so it peeked
+// every five seconds indefinitely, on every open tab and PWA copy, for sixteen hours.
+// The window exists to wait out a parse; past this the answer is not coming and the
+// five-minute refresh is the right instrument.
+const PARSE_MAX_LIFE_MS = 15 * 60 * 1000;
 let parseTimer = null;
+let parseStartedAt = 0;
 let parseDeadline = 0;
 let tickInFlight = false;
 let lastTickAt = 0;
@@ -1304,6 +1312,7 @@ function datesAwaitingParse() {
  */
 function watchForParse(restart = true) {
   if (!datesAwaitingParse().length) return stopWatch();
+  if (restart || !parseStartedAt) parseStartedAt = Date.now();
   if (restart) parseDeadline = Date.now() + PARSE_WINDOW_MS;
   // A tick that is mid-await holds no timer, so without the in-flight check a restart
   // here would fork a second tick chain that then polls alongside the first forever.
@@ -1317,6 +1326,8 @@ function watchForParse(restart = true) {
 function stopWatch() {
   if (parseTimer) clearTimeout(parseTimer);
   parseTimer = null;
+  // Without this the next watch inherits the old start time and dies immediately.
+  parseStartedAt = 0;
 }
 
 function reschedule(ms = PARSE_TICK_MS) {
@@ -1349,6 +1360,10 @@ async function parseTick() {
     // refreshData, which reads past a stuck write and merges.
     if (S.pendingCount()) {
       if (!S.stuckWrite()) {
+        if (Date.now() - parseStartedAt > PARSE_MAX_LIFE_MS) {
+          S.dbg(`parse tick: giving up after ${Math.round((Date.now() - parseStartedAt) / 60000)}min with a write still queued — the 5-minute refresh takes it from here`);
+          return stopWatch();
+        }
         S.dbg(`parse tick: ${S.pendingCount()} write(s) still queued, holding window open`);
         parseDeadline = Date.now() + PARSE_WINDOW_MS;
         return reschedule();
@@ -1400,6 +1415,10 @@ async function parseTick() {
     // and poll gently, because hammering a secondary limit extends the ban.
     const limitedUntil = S.rateLimitedUntil();
     if (limitedUntil) {
+      if (Date.now() - parseStartedAt > PARSE_MAX_LIFE_MS) {
+        S.dbg('parse tick: giving up — rate-limited for longer than the watch is allowed to live');
+        return stopWatch();
+      }
       if (parseDeadline < limitedUntil) {
         S.dbg(`parse tick: rate-limited, backing off to 60s ticks until ~${new Date(limitedUntil).toLocaleTimeString()}`);
         parseDeadline = limitedUntil + PARSE_WINDOW_MS;
