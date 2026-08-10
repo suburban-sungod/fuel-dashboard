@@ -526,7 +526,7 @@ function renderFlags(t, tot) {
 
   // Named slots beat clock times here: "Breakfast and Lunch are short" is actionable in a
   // way that "07:20, 12:30 are short" never was.
-  const short = F.byCategory(today().entries, t, state.athlete, dayRide(t), t.day.type)
+  const short = F.byCategory(today().entries, t, state.athlete, daySession(t), t.day.type)
     .filter((m) => m.proteinShort);
   // Same reason the suggester goes quiet: on a closed day this is a complaint about a
   // meal he can no longer do anything about.
@@ -586,11 +586,9 @@ function entryAgeSec(e) {
 
 // ---------- entries, grouped into meals ----------
 
-/** The day's fuelled session — done if there is one, otherwise the plan. */
-function dayRide(t) {
-  const done = t.workouts.filter((w) => !['strength', 'swim', 'other'].includes(w.type));
-  const plan = t.planned.filter((p) => !['strength', 'swim', 'other'].includes(p.type));
-  return done[0] || plan[0] || null;
+/** The session the day's fuelling hangs off: a ride if there is one, else a lift or swim. */
+function daySession(t) {
+  return F.daySession(t.workouts, t.planned);
 }
 
 /** "640 of 900 kcal · 30g P" — what this slot is for, in one line. */
@@ -612,8 +610,9 @@ function categoryTargetLine(c) {
   }
   // Snacks have no target by design, so with nothing logged there is nothing to say —
   // and a blank line next to a heading reads as a rendering fault rather than an
-  // intentional absence.
-  if (!bits.length) return c.target.kcal == null && c.target.protein == null ? 'whatever is left' : '—';
+  // intentional absence. Session slots that ask for nothing already explain themselves
+  // in the note underneath, so "whatever is left" there would be snack copy on a lift.
+  if (!bits.length) return c.id === 'snack' ? 'whatever is left' : '';
   return bits.join(' · ');
 }
 
@@ -621,16 +620,16 @@ function renderEntries() {
   const box = $('#entries');
   box.innerHTML = '';
   const t = F.targetsFor(state.date, ctx());
-  const ride = dayRide(t);
-  const groups = F.byCategory(today().entries, t, state.athlete, ride, t.day.type);
+  const session = daySession(t);
+  const groups = F.byCategory(today().entries, t, state.athlete, session, t.day.type);
 
   for (const m of groups) {
     // The ride slots stay visible on a rest day rather than vanishing, so the diary has
     // the same shape every day and he never wonders where a section went. They just have
     // nothing to ask of him.
-    const idle = m.ride && !ride;
+    const idle = m.session && !session.session;
     const head = el('div', 'cat-head' + (m.proteinShort ? ' short' : '') + (idle ? ' idle' : ''));
-    const detail = idle ? 'no ride today' : categoryTargetLine(m);
+    const detail = idle ? 'no session today' : categoryTargetLine(m);
     head.innerHTML = `<span class="cat-name">${m.label}</span><span class="cat-target">${detail}</span>`;
 
     const add = el('button', 'cat-add', '+');

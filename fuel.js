@@ -487,15 +487,46 @@ export function carbRate(durationMin, intensityFactor, athlete) {
 // pre and post, and the protein-per-meal minimum drives the three meals. This just puts
 // each number next to the food it is about, instead of in a paragraph underneath.
 
+// The three session slots keep the ids they were born with — `prebike`, `bike`, `postbike`
+// — because entries already carry them. Only the labels move with the day, so a lift is
+// never called a bike ride and nothing has to be migrated.
 export const CATEGORIES = [
   { id: 'breakfast', label: 'Breakfast' },
-  { id: 'prebike', label: 'Pre-bike', ride: true },
-  { id: 'bike', label: 'On the bike', ride: true },
-  { id: 'postbike', label: 'Post-bike', ride: true },
+  { id: 'prebike', label: 'Pre-bike', session: true },
+  { id: 'bike', label: 'On the bike', session: true },
+  { id: 'postbike', label: 'Post-bike', session: true },
   { id: 'lunch', label: 'Lunch' },
   { id: 'dinner', label: 'Dinner' },
   { id: 'snack', label: 'Snacks' },
 ];
+
+const SESSION_LABELS = {
+  cycling: ['Pre-bike', 'On the bike', 'Post-bike'],
+  strength: ['Pre-lift', 'During the lift', 'Post-lift'],
+  swim: ['Pre-swim', 'During the swim', 'Post-swim'],
+  none: ['Pre-session', 'During', 'Post-session'],
+};
+
+/**
+ * The session the day's fuelling hangs off, and what kind it is.
+ *
+ * A ride wins when there is one: it is the only session long enough to need feeding while
+ * it happens. Otherwise a lift or a swim, which for him is 45 minutes of instruction and
+ * strength work rather than a fuelling problem. Completed beats planned in every case.
+ */
+export function daySession(workouts, planned) {
+  const pick = (list, match) => (list || []).filter(match)[0] || null;
+  const isRide = (w) => !NON_FUELLED.has(w.type);
+  const isStrengthish = (w) => w.type === 'strength' || w.type === 'swim';
+
+  const ride = pick(workouts, isRide) || pick(planned, isRide);
+  if (ride) return { kind: 'cycling', session: ride, fuelled: true };
+
+  const other = pick(workouts, isStrengthish) || pick(planned, isStrengthish);
+  if (other) return { kind: other.type, session: other, fuelled: false };
+
+  return { kind: 'none', session: null, fuelled: false };
+}
 
 // How the day's non-ride calories divide across the three meals. Snacks deliberately get
 // no calorie target: they are the remainder, and giving a remainder a target invites
@@ -509,16 +540,19 @@ const MEAL_SPLIT = { breakfast: 0.3, lunch: 0.35, dinner: 0.35 };
  * without one this never returns pre/on/post — a breakfast on a rest day must not be
  * filed as pre-bike just because it was early.
  */
-export function categoryOf(entry, ride = null) {
+export function categoryOf(entry, day = null) {
   if (entry?.cat) return entry.cat;
   const m = minutesOf(entry?.time);
   if (m == null) return 'snack';
 
-  if (ride) {
-    const start = minutesOf(ride.start_time);
-    const end = start == null ? null : start + (ride.duration_min || 0);
+  const { session, fuelled } = day?.kind ? day : { session: day, fuelled: !!day };
+  if (session) {
+    const start = minutesOf(session.start_time);
+    const end = start == null ? null : start + (session.duration_min || 0);
     if (start != null) {
-      if (m >= start && m <= end) return 'bike';
+      // Nothing is eaten during a 45-minute lift, so never file anything there by
+      // inference — a mid-morning snack that happens to overlap a gym session is a snack.
+      if (fuelled && m >= start && m <= end) return 'bike';
       if (m < start && start - m <= PREFUEL_WINDOW_MIN) return 'prebike';
       if (m > end && m - end <= RECOVERY_WINDOW_MIN) return 'postbike';
     }
@@ -536,30 +570,48 @@ export function categoryOf(entry, ride = null) {
  * without one, so a rest day shows three slots with no targets rather than three slots
  * demanding 90g of carbs an hour.
  */
-export function categoryTargets(targets, athlete, ride = null, dayType = 'rest') {
+export function categoryTargets(targets, athlete, day = null, dayType = 'rest') {
+  const { kind, session, fuelled } = day?.kind ? day : { kind: day ? 'cycling' : 'none', session: day, fuelled: !!day };
   const out = {};
   for (const c of CATEGORIES) out[c.id] = { kcal: null, protein: null, carbs: null, note: '' };
 
-  const rate = ride ? carbRate(ride.duration_min, rideIntensity(ride, athlete), athlete) : null;
-  if (rate) {
-    out.bike.carbs = rate.total_low;
-    out.bike.carbs_high = rate.total_high;
-    // On-bike carbs are the calories. Nobody eats fat or protein on a hard ride.
-    out.bike.kcal = Math.round(rate.total_low * 4);
-    out.bike.note = `${rate.low}–${rate.high}g/hr over ${rate.hours.toFixed(1)}h`;
-    if (rate.needsBlend) out.bike.blend = rate.blendNote;
-  }
+  const labels = SESSION_LABELS[kind] || SESSION_LABELS.none;
+  ['prebike', 'bike', 'postbike'].forEach((id, i) => { out[id].label = labels[i]; });
 
-  if (ride) {
+  if (fuelled && session) {
+    const rate = carbRate(session.duration_min, rideIntensity(session, athlete), athlete);
+    if (rate) {
+      out.bike.carbs = rate.total_low;
+      out.bike.carbs_high = rate.total_high;
+      // On-bike carbs are the calories. Nobody eats fat or protein on a hard ride.
+      out.bike.kcal = Math.round(rate.total_low * 4);
+      out.bike.note = `${rate.low}–${rate.high}g/hr over ${rate.hours.toFixed(1)}h`;
+      if (rate.needsBlend) out.bike.blend = rate.blendNote;
+    } else {
+      out.bike.note = 'under an hour — water is enough';
+    }
+
     const [lo, hi] = dayType === 'high' ? [120, 170] : [80, 120];
     out.prebike.carbs = lo;
     out.prebike.carbs_high = hi;
     out.prebike.kcal = Math.round(lo * 4);
-    out.prebike.note = `in the 3h before, easy on the fat`;
+    out.prebike.note = 'in the 3h before, easy on the fat';
 
     out.postbike.protein = 30;
     out.postbike.protein_high = 40;
     out.postbike.note = 'within an hour of finishing';
+  } else if (session) {
+    // A lift, or a swim, which for him is 45 minutes of instruction and strength work.
+    // Two of these three slots exist to say "nothing here", which is genuinely useful:
+    // the mistake on a strength day is treating it like a ride and carb-loading for it.
+    out.prebike.note = 'nothing required — 20–30g carbs if you train before breakfast';
+    out.bike.note = 'nothing needed, just water';
+    // The one target on a strength day that earns its place. Lifting in a calorie deficit
+    // at 53 costs lean mass unless protein turns up afterwards, and protein is the number
+    // he routinely finishes the day short on.
+    out.postbike.protein = 30;
+    out.postbike.protein_high = 40;
+    out.postbike.note = 'within an hour or two — this is what protects lean mass in a deficit';
   }
 
   const minProtein = athlete.protein_min_per_meal_g || 30;
@@ -577,22 +629,27 @@ export function categoryTargets(targets, athlete, ride = null, dayType = 'rest')
 }
 
 /** Group a day's entries into the seven slots, with totals against target. */
-export function byCategory(entries, targets, athlete, ride = null, dayType = 'rest') {
-  const tg = categoryTargets(targets, athlete, ride, dayType);
+export function byCategory(entries, targets, athlete, day = null, dayType = 'rest') {
+  const tg = categoryTargets(targets, athlete, day, dayType);
   return CATEGORIES.map((c) => {
     const items = (entries || [])
-      .filter((e) => categoryOf(e, ride) === c.id)
+      .filter((e) => categoryOf(e, day) === c.id)
       .sort((a, b) => (a.time || '').localeCompare(b.time || ''));
     const tot = dayTotals(items);
     const target = tg[c.id];
     return {
       ...c,
+      // The session slots rename themselves for the day: a lift must never be labelled
+      // "On the bike".
+      label: target.label || c.label,
       entries: items,
       ...tot,
       target,
-      // Only a slot that has food in it can be short. An empty breakfast at 7am is not a
-      // failure, it is a breakfast that has not happened yet.
-      proteinShort: items.length > 0 && target.protein != null && tot.protein < target.protein,
+      // A slot is only short once it holds an actual meal. Empty means it has not happened
+      // yet, and a lone black coffee is not a breakfast that failed to reach 30g of
+      // protein — the same `meal_min_kcal` guard the old time-based clustering used.
+      proteinShort: tot.kcal >= (athlete.meal_min_kcal ?? 250)
+        && target.protein != null && tot.protein < target.protein,
       proteinGap: target.protein == null ? 0 : Math.max(0, target.protein - tot.protein),
     };
   });
