@@ -476,6 +476,128 @@ export function carbRate(durationMin, intensityFactor, athlete) {
   };
 }
 
+// ---------- the diary, by category ----------
+//
+// Seven slots, in the order the day actually happens. He picks the slot by tapping the Add
+// button in it, so nothing here has to guess — `categoryOf` exists only for entries logged
+// before this existed, and for the Siri Shortcut, which has no way to say.
+//
+// The targets are NOT new doctrine. Every number below already appears somewhere on the
+// page: the carb-rate rules drive the bike, the 3h-before and 1h-after guidance drive
+// pre and post, and the protein-per-meal minimum drives the three meals. This just puts
+// each number next to the food it is about, instead of in a paragraph underneath.
+
+export const CATEGORIES = [
+  { id: 'breakfast', label: 'Breakfast' },
+  { id: 'prebike', label: 'Pre-bike', ride: true },
+  { id: 'bike', label: 'On the bike', ride: true },
+  { id: 'postbike', label: 'Post-bike', ride: true },
+  { id: 'lunch', label: 'Lunch' },
+  { id: 'dinner', label: 'Dinner' },
+  { id: 'snack', label: 'Snacks' },
+];
+
+// How the day's non-ride calories divide across the three meals. Snacks deliberately get
+// no calorie target: they are the remainder, and giving a remainder a target invites
+// eating up to it.
+const MEAL_SPLIT = { breakfast: 0.3, lunch: 0.35, dinner: 0.35 };
+
+/**
+ * Which slot an entry belongs to when it does not say.
+ *
+ * Only for legacy entries and Shortcut drops. Ride-relative slots need the ride, so
+ * without one this never returns pre/on/post — a breakfast on a rest day must not be
+ * filed as pre-bike just because it was early.
+ */
+export function categoryOf(entry, ride = null) {
+  if (entry?.cat) return entry.cat;
+  const m = minutesOf(entry?.time);
+  if (m == null) return 'snack';
+
+  if (ride) {
+    const start = minutesOf(ride.start_time);
+    const end = start == null ? null : start + (ride.duration_min || 0);
+    if (start != null) {
+      if (m >= start && m <= end) return 'bike';
+      if (m < start && start - m <= PREFUEL_WINDOW_MIN) return 'prebike';
+      if (m > end && m - end <= RECOVERY_WINDOW_MIN) return 'postbike';
+    }
+  }
+  if (m < 10 * 60) return 'breakfast';
+  if (m >= 11 * 60 && m < 15 * 60) return 'lunch';
+  if (m >= 17 * 60 && m < 21 * 60 + 30) return 'dinner';
+  return 'snack';
+}
+
+/**
+ * Per-category targets for a day, derived from that day's own numbers.
+ *
+ * `ride` is the day's fuelled session, or null. Everything ride-relative returns null
+ * without one, so a rest day shows three slots with no targets rather than three slots
+ * demanding 90g of carbs an hour.
+ */
+export function categoryTargets(targets, athlete, ride = null, dayType = 'rest') {
+  const out = {};
+  for (const c of CATEGORIES) out[c.id] = { kcal: null, protein: null, carbs: null, note: '' };
+
+  const rate = ride ? carbRate(ride.duration_min, rideIntensity(ride, athlete), athlete) : null;
+  if (rate) {
+    out.bike.carbs = rate.total_low;
+    out.bike.carbs_high = rate.total_high;
+    // On-bike carbs are the calories. Nobody eats fat or protein on a hard ride.
+    out.bike.kcal = Math.round(rate.total_low * 4);
+    out.bike.note = `${rate.low}–${rate.high}g/hr over ${rate.hours.toFixed(1)}h`;
+    if (rate.needsBlend) out.bike.blend = rate.blendNote;
+  }
+
+  if (ride) {
+    const [lo, hi] = dayType === 'high' ? [120, 170] : [80, 120];
+    out.prebike.carbs = lo;
+    out.prebike.carbs_high = hi;
+    out.prebike.kcal = Math.round(lo * 4);
+    out.prebike.note = `in the 3h before, easy on the fat`;
+
+    out.postbike.protein = 30;
+    out.postbike.protein_high = 40;
+    out.postbike.note = 'within an hour of finishing';
+  }
+
+  const minProtein = athlete.protein_min_per_meal_g || 30;
+  // What the three meals have to cover: the day, less what the ride slots already account
+  // for. Without this a ride day double-counts its own fuelling and the meal targets come
+  // out absurd.
+  const ridekcal = (out.bike.kcal || 0) + (out.prebike.kcal || 0);
+  const mealKcal = targets.kcal_target == null ? null : Math.max(0, targets.kcal_target - ridekcal);
+
+  for (const id of ['breakfast', 'lunch', 'dinner']) {
+    out[id].protein = minProtein;
+    out[id].kcal = mealKcal == null ? null : Math.round(mealKcal * MEAL_SPLIT[id]);
+  }
+  return out;
+}
+
+/** Group a day's entries into the seven slots, with totals against target. */
+export function byCategory(entries, targets, athlete, ride = null, dayType = 'rest') {
+  const tg = categoryTargets(targets, athlete, ride, dayType);
+  return CATEGORIES.map((c) => {
+    const items = (entries || [])
+      .filter((e) => categoryOf(e, ride) === c.id)
+      .sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+    const tot = dayTotals(items);
+    const target = tg[c.id];
+    return {
+      ...c,
+      entries: items,
+      ...tot,
+      target,
+      // Only a slot that has food in it can be short. An empty breakfast at 7am is not a
+      // failure, it is a breakfast that has not happened yet.
+      proteinShort: items.length > 0 && target.protein != null && tot.protein < target.protein,
+      proteinGap: target.protein == null ? 0 : Math.max(0, target.protein - tot.protein),
+    };
+  });
+}
+
 // ---------- what should I eat now ----------
 //
 // Suggests from Matt's OWN food list, never from a generic database. The value is not

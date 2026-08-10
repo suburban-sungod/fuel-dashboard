@@ -14,7 +14,7 @@ const signed = (n) => (n == null ? '—' : (n >= 0 ? '+' : '−') + Math.abs(Mat
 const state = {
   athlete: null, weights: [], templates: { meals: [], singles: [] },
   workouts: [], planned: [], logs: {}, months: {}, status: null,
-  date: F.isoDate(new Date()), view: 'today', pendingTab: 'meals',
+  date: F.isoDate(new Date()), view: 'today', pendingTab: 'meals', category: null,
 };
 
 // The real calendar date as of the last check, so a midnight rollover can be detected.
@@ -392,12 +392,27 @@ function renderHero() {
   const dates = F.weekDates(state.date, realToday);
   const wk = F.cumulativeDeficit(dates, ctx(), state.logs, realToday);
 
-  const n = $('#hero-number');
-  const cls = wk.loggedDays === 0 ? 'flat' : wk.variance >= 0 ? 'ahead' : 'behind';
-  n.className = 'hero-number ' + cls;
-  n.textContent = wk.loggedDays === 0 ? 'No closed days yet' : `${signed(wk.variance)} kcal`;
+  // Monday morning had nothing to say: a dead "No closed days yet" sitting where the
+  // number lives, on the one day of the week he most wants a reason to hold the line.
+  // Last week's finished total is real information and it sets the bar, so it holds the
+  // headline until this week has banked a day of its own.
+  // weekDates caps at its second argument, which defaults to the first — pass the Sunday
+  // explicitly or this asks for a one-day week and reports last week as a single Monday.
+  const lastMon = F.addDays(F.weekStart(state.date), -7);
+  const lastWk = wk.loggedDays === 0
+    ? F.cumulativeDeficit(F.weekDates(lastMon, F.addDays(lastMon, 6)), ctx(), state.logs)
+    : null;
+  const showLast = lastWk && lastWk.loggedDays > 0;
 
-  $('#hero-week').textContent = `from Mon ${localDate(F.weekStart(state.date)).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })}`;
+  const n = $('#hero-number');
+  const shown = showLast ? lastWk : wk;
+  const cls = wk.loggedDays === 0 && !showLast ? 'flat' : shown.variance >= 0 ? 'ahead' : 'behind';
+  n.className = 'hero-number ' + cls + (showLast ? ' carried' : '');
+  n.textContent = wk.loggedDays === 0 && !showLast ? 'Fresh week' : `${signed(shown.variance)} kcal`;
+
+  $('#hero-week').textContent = showLast
+    ? 'last week'
+    : `from Mon ${localDate(F.weekStart(state.date)).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })}`;
 
   // Today is shown live but never folded into the total — half a day of eating always
   // looks like a deficit, and that is the flattering error this page exists to kill.
@@ -405,15 +420,20 @@ function renderHero() {
     ? ` Today so far: ${num(wk.open.intake)} of ${num(wk.open.target)}, not counted until the day closes.`
     : wk.open ? ' Today is still open and not counted yet.' : '';
 
-  $('#hero-sub').textContent = (wk.loggedDays === 0
-    ? 'Nothing complete this week yet.'
-    : `${wk.variance >= 0 ? 'Ahead of' : 'Behind'} plan across ${wk.loggedDays} closed ${wk.loggedDays === 1 ? 'day' : 'days'}.`) + openBit;
+  const lead = showLast
+    ? `${lastWk.variance >= 0 ? 'Ahead of' : 'Behind'} plan across ${lastWk.loggedDays} closed ${lastWk.loggedDays === 1 ? 'day' : 'days'} last week. This week starts here.`
+    : wk.loggedDays === 0
+      ? 'Nothing banked yet. Close a day to start counting.'
+      : `${wk.variance >= 0 ? 'Ahead of' : 'Behind'} plan across ${wk.loggedDays} closed ${wk.loggedDays === 1 ? 'day' : 'days'}.`;
+  $('#hero-sub').textContent = lead + openBit;
 
   // per-day bars, scaled to the largest absolute variance in the week
   const bars = $('#hero-bars');
   bars.innerHTML = '';
-  const max = Math.max(400, ...wk.days.map((d) => Math.abs(d.variance || 0)));
-  for (const d of wk.days) {
+  // The bars follow the headline. Showing this week's single empty Monday under a carried
+  // number rendered as one dashed box and a lone "M", which reads as a broken chart.
+  const max = Math.max(400, ...shown.days.map((d) => Math.abs(d.variance || 0)));
+  for (const d of shown.days) {
     const b = el('div', 'hb ' + (d.variance == null ? '' : d.variance >= 0 ? 'under' : 'over') + (d.open ? ' open' : ''));
     if (d.variance != null) {
       const h = Math.max(4, (Math.abs(d.variance) / max) * 34);
@@ -428,10 +448,12 @@ function renderHero() {
     bars.appendChild(b);
   }
 
+  // Matches whichever week the headline is reporting — three zeroes under a carried
+  // number would read as the number being broken.
   $('#hero-detail').innerHTML = `
-    <div><b>${num(wk.actual)}</b><span>actual deficit</span></div>
-    <div><b>${num(wk.planned)}</b><span>planned</span></div>
-    <div><b>${wk.projectedKg >= 0 ? '−' : '+'}${Math.abs(wk.projectedKg).toFixed(2)} kg</b><span>implied so far</span></div>`;
+    <div><b>${num(shown.actual)}</b><span>actual deficit</span></div>
+    <div><b>${num(shown.planned)}</b><span>planned</span></div>
+    <div><b>${shown.projectedKg >= 0 ? '−' : '+'}${Math.abs(shown.projectedKg).toFixed(2)} kg</b><span>implied ${showLast ? 'last week' : 'so far'}</span></div>`;
 }
 
 // ---------- today ----------
@@ -502,12 +524,14 @@ function renderFlags(t, tot) {
     add('bad', `<b>No weigh-in on record.</b> Targets can't be computed without one.`);
   }
 
-  const meals = F.mealClusters(today().entries, state.athlete);
-  const short = meals.filter((m) => m.proteinShort);
+  // Named slots beat clock times here: "Breakfast and Lunch are short" is actionable in a
+  // way that "07:20, 12:30 are short" never was.
+  const short = F.byCategory(today().entries, t, state.athlete, dayRide(t), t.day.type)
+    .filter((m) => m.proteinShort);
   // Same reason the suggester goes quiet: on a closed day this is a complaint about a
   // meal he can no longer do anything about.
   if (short.length && !dayIsClosed()) {
-    add('warn', `<b>${short.length} ${short.length === 1 ? 'meal' : 'meals'} under ${state.athlete.protein_min_per_meal_g}g protein.</b> Distribution matters as much as the daily total — ${short.map((m) => hhmm(m.start)).join(', ')}.`);
+    add('warn', `<b>${short.map((m) => m.label).join(' and ')} under ${state.athlete.protein_min_per_meal_g}g protein.</b> Distribution matters as much as the daily total — ${short.map((m) => `${m.label} ${Math.round(m.proteinGap)}g short`).join(', ')}.`);
   }
 
   const pendingEntries = today().entries.filter((e) => e.source === 'freetext' && e.parse_state !== 'failed');
@@ -562,17 +586,61 @@ function entryAgeSec(e) {
 
 // ---------- entries, grouped into meals ----------
 
+/** The day's fuelled session — done if there is one, otherwise the plan. */
+function dayRide(t) {
+  const done = t.workouts.filter((w) => !['strength', 'swim', 'other'].includes(w.type));
+  const plan = t.planned.filter((p) => !['strength', 'swim', 'other'].includes(p.type));
+  return done[0] || plan[0] || null;
+}
+
+/** "640 of 900 kcal · 30g P" — what this slot is for, in one line. */
+function categoryTargetLine(c) {
+  const tg = c.target;
+  const bits = [];
+  if (tg.kcal != null) bits.push(`${num(c.kcal)} of ${num(tg.kcal)} kcal`);
+  else if (c.kcal) bits.push(`${num(c.kcal)} kcal`);
+  if (tg.carbs != null) {
+    bits.push(`${num(c.carbs)} of ${tg.carbs}${tg.carbs_high ? `–${tg.carbs_high}` : ''}g carbs`);
+  } else if (tg.protein != null) {
+    // When it is short, the gap is the only number worth the width — "24 of 30g protein
+    // · 6g short" says the same thing twice and wraps onto a second line on a phone.
+    bits.push(c.proteinShort
+      ? `${Math.round(c.proteinGap)}g protein short`
+      : `${num(c.protein)} of ${tg.protein}${tg.protein_high ? `–${tg.protein_high}` : ''}g protein`);
+  } else if (c.protein) {
+    bits.push(`${num(c.protein)}g P`);
+  }
+  // Snacks have no target by design, so with nothing logged there is nothing to say —
+  // and a blank line next to a heading reads as a rendering fault rather than an
+  // intentional absence.
+  if (!bits.length) return c.target.kcal == null && c.target.protein == null ? 'whatever is left' : '—';
+  return bits.join(' · ');
+}
+
 function renderEntries() {
   const box = $('#entries');
   box.innerHTML = '';
-  const meals = F.mealClusters(today().entries, state.athlete);
-  if (!meals.length) { box.appendChild(el('p', 'muted small', 'Nothing logged yet.')); return; }
+  const t = F.targetsFor(state.date, ctx());
+  const ride = dayRide(t);
+  const groups = F.byCategory(today().entries, t, state.athlete, ride, t.day.type);
 
-  for (const m of meals) {
-    const head = el('div', 'meal-head' + (m.proteinShort ? ' short' : ''));
-    head.innerHTML = `<span>${hhmm(m.start)}${m.end !== m.start ? '–' + hhmm(m.end) : ''}</span>
-      <span>${num(m.kcal)} kcal · ${num(m.protein)}g P${m.proteinShort ? ` · ${Math.round(m.proteinGap)}g short` : ''}</span>`;
+  for (const m of groups) {
+    // The ride slots stay visible on a rest day rather than vanishing, so the diary has
+    // the same shape every day and he never wonders where a section went. They just have
+    // nothing to ask of him.
+    const idle = m.ride && !ride;
+    const head = el('div', 'cat-head' + (m.proteinShort ? ' short' : '') + (idle ? ' idle' : ''));
+    const detail = idle ? 'no ride today' : categoryTargetLine(m);
+    head.innerHTML = `<span class="cat-name">${m.label}</span><span class="cat-target">${detail}</span>`;
+
+    const add = el('button', 'cat-add', '+');
+    add.title = `Log ${m.label.toLowerCase()}`;
+    add.onclick = () => openSheet(null, m.id);
+    head.appendChild(add);
     box.appendChild(head);
+
+    if (m.target.note) box.appendChild(el('div', 'cat-note muted small', escapeHtml(m.target.note)));
+    if (m.target.blend) box.appendChild(el('div', 'cat-note warn small', escapeHtml(m.target.blend)));
 
     for (const e of m.entries) {
       const failed = e.parse_state === 'failed';
@@ -621,6 +689,8 @@ function renderEntries() {
       box.appendChild(row);
     }
   }
+
+  if (!today().entries.length) box.appendChild(el('p', 'muted small', 'Nothing logged yet.'));
 }
 
 function escapeHtml(s) { return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
@@ -1035,8 +1105,12 @@ function renderSettings() {
  * without this the only way to fix a portion, a time, or a food the parser choked on was
  * to delete it and type the whole thing again.
  */
-function openSheet(entry = null) {
+function openSheet(entry = null, category = null) {
   state.editing = entry ? entry.id : null;
+  // Which slot's + was tapped. Editing keeps whatever the entry already had, so moving a
+  // late dinner into Snacks is a matter of deleting and re-adding rather than a silent
+  // reclassification every time he fixes a typo.
+  state.category = entry ? (entry.cat || null) : category;
   const now = new Date();
   $('#entry-time').value = entry
     ? entry.time
@@ -1069,7 +1143,7 @@ function selectTab(tab) {
   showTab(tab);
 }
 
-function closeSheet() { $('#sheet').hidden = true; state.editing = null; }
+function closeSheet() { $('#sheet').hidden = true; state.editing = null; state.category = null; }
 
 function renderTiles() {
   const grid = $('#sheet-meals');
@@ -1103,6 +1177,7 @@ function addEntry(item, source) {
     label: item.label,
     kcal: item.kcal, protein: item.protein, carbs: item.carbs, fat: item.fat,
     source, note: item.detail || '',
+    ...(state.category ? { cat: state.category } : {}),
   };
   saveDay({ ...day, entries: [...day.entries, entry].sort((a, b) => a.time.localeCompare(b.time)) });
   closeSheet();
@@ -1145,6 +1220,7 @@ async function addCustom() {
       carbs: Number($('#c-carbs').value) || 0,
       fat: Number($('#c-fat').value) || 0,
       source: 'manual', note: '',
+      ...(state.category ? { cat: state.category } : {}),
     };
   } else {
     // No macros: try Matt's own food list on-device first. Instant, free, offline, and it
@@ -1152,8 +1228,10 @@ async function addCustom() {
     const hit = F.matchEntry(label, state.templates);
     entry = hit
       ? { id, time, label: hit.label, kcal: hit.kcal, protein: hit.protein, carbs: hit.carbs,
-          fat: hit.fat, source: 'matched', note: hit.anyEstimate ? 'includes an estimated item' : '' }
+          fat: hit.fat, source: 'matched', note: hit.anyEstimate ? 'includes an estimated item' : '',
+          ...(state.category ? { cat: state.category } : {}) }
       : { id, time, label, kcal: 0, protein: 0, carbs: 0, fat: 0,
+          ...(state.category ? { cat: state.category } : {}),
           // Stamped so the UI can tell a spinner that is 5 seconds old from one that is
           // three minutes old. The clock time alone cannot: he backdates entries.
           source: 'freetext', parse_state: 'pending', note: '', logged_at: Date.now() };

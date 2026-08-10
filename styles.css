@@ -207,6 +207,32 @@ h2 { font-size: 12px; font-weight: 650; letter-spacing: .05em; text-transform: u
 .meal-head.short { color: var(--warn); font-weight: 650; }
 .meal-head:first-child { margin-top: 0; }
 
+/* ---------- diary categories ---------- */
+/* Seven fixed slots, each with its own Add. The slot is chosen by which + he taps, so the
+   header has to carry the name, what the slot is for, and the button, on one phone-width
+   line without wrapping. */
+
+.cat-head {
+  display: flex; align-items: baseline; gap: 8px;
+  margin-top: 18px; padding-bottom: 5px; border-bottom: 1px solid var(--border);
+}
+.cat-head:first-child { margin-top: 2px; }
+.cat-name { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--txt2); }
+.cat-target { flex: 1; font-size: 11px; color: var(--txt3); text-align: right; }
+.cat-head.short .cat-target { color: var(--warn); font-weight: 650; }
+/* A slot with nothing to ask of him today should not read as a slot he has neglected. */
+.cat-head.idle .cat-name, .cat-head.idle .cat-target { opacity: .45; }
+
+.cat-add {
+  flex: none; width: 26px; height: 26px; align-self: center;
+  border-radius: 8px; border: 1px solid var(--border); background: var(--surface2);
+  color: var(--accent); font-size: 17px; line-height: 1; font-family: inherit;
+  cursor: pointer; padding: 0;
+}
+.cat-add:active { background: var(--accent); color: #fff; }
+.cat-note { margin: 5px 0 0; }
+.cat-note.warn { color: var(--warn); }
+
 /* ---------- chips ---------- */
 
 .chips { display: flex; flex-wrap: wrap; gap: 7px; }
