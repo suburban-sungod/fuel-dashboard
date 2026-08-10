@@ -344,7 +344,10 @@ async function syncNow() {
   const done = res.workouts.filter((w) => w.date === F.isoDate(new Date())).length;
   out.textContent = `${res.workouts.length} workouts, ${res.planned.length} planned`
     + (done ? ` · ${done} logged today` : ' · nothing recorded today yet')
-    + (newWeighIns > 0 ? ` · ${newWeighIns} new weigh-${newWeighIns === 1 ? 'in' : 'ins'}` : '');
+    + (newWeighIns > 0 ? ` · ${newWeighIns} new weigh-${newWeighIns === 1 ? 'in' : 'ins'}` : '')
+    // Worth calling out separately: it is the one number on the page that was measured
+    // rather than modelled, and its absence means Speediance did not answer.
+    + (res.lifts ? ` · ${res.lifts} measured lift${res.lifts === 1 ? '' : 's'}` : '');
   btn.disabled = false;
   render();
   flush();
