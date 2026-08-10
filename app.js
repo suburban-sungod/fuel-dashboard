@@ -13,7 +13,11 @@ const signed = (n) => (n == null ? '—' : (n >= 0 ? '+' : '−') + Math.abs(Mat
 
 const state = {
   athlete: null, weights: [], templates: { meals: [], singles: [] },
-  workouts: [], planned: [], logs: {}, months: {}, status: null,
+  workouts: [], planned: [], logs: {}, status: null,
+  // Which months this session has pulled. There is no month FILE any more — the server
+  // assembles days from rows — but the app still pages a month at a time, so this is what
+  // stops it re-asking for one it already has.
+  loadedMonths: new Set(),
   date: F.isoDate(new Date()), view: 'today', pendingTab: 'meals', category: null,
 };
 
@@ -23,7 +27,7 @@ let rolloverDate = F.isoDate(new Date());
 // ============ boot ============
 
 async function boot() {
-  if (!S.getToken()) return showGate();
+  if (!S.getKey()) return showGate();
   $('#app').hidden = false;
   try {
     await loadAll();
@@ -80,16 +84,15 @@ function showLoadFailure() {
   $('#gate').hidden = false;
   $('#gate').innerHTML = `<div class="gate-card">
     <h1>Can't load your profile</h1>
-    <p class="muted">The app reached this device but couldn't read <code>athlete.json</code> from
-    the private repo, and there is no cached copy here yet. Nothing is lost — this device just
-    has nothing to work from.</p>
-    <p class="muted">Usually one of: no signal right now, the token has expired, or the token
-    was issued without <strong>Contents: Read and write</strong> on <code>fuel-data</code>.</p>
+    <p class="muted">The app reached this device but couldn't read your profile from the
+    server, and there is no cached copy here yet. Nothing is lost — this device just has
+    nothing to work from.</p>
+    <p class="muted">Usually one of: no signal right now, or the key has been rotated.</p>
     <button id="retry" class="btn-primary">Try again</button>
-    <button id="reset-token" class="link-btn" style="margin-top:10px">Use a different token</button>
+    <button id="reset-token" class="link-btn" style="margin-top:10px">Use a different key</button>
   </div>`;
   $('#retry').onclick = () => location.reload();
-  $('#reset-token').onclick = () => { S.clearToken(); location.reload(); };
+  $('#reset-token').onclick = () => { S.clearKey(); location.reload(); };
 }
 
 function showGate() {
@@ -100,8 +103,8 @@ function showGate() {
     errBox.hidden = true;
     if (!t) return;
     try {
-      await S.verifyToken(t);
-      S.setToken(t);
+      await S.verifyKey(t);
+      S.setKey(t);
       location.reload();
     } catch (e) {
       errBox.textContent = e.message;
@@ -111,17 +114,26 @@ function showGate() {
   $('#token-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#token-save').click(); });
 }
 
+/** Every month the opening screens touch: this week, and the three weeks behind it. */
+function bootMonths() {
+  const dates = F.weekDates(state.date, F.isoDate(new Date())).concat(recentDates(21));
+  return [...new Set(dates.map(S.monthOf))].sort();
+}
+
 async function loadAll() {
-  const [athlete, weights, templates, workouts, planned, status] = await Promise.all([
-    S.readJSON(S.paths.athlete),
-    S.readJSON(S.paths.weight, []),
-    S.readJSON(S.paths.templates, { meals: [], singles: [] }),
-    S.readJSON(S.paths.workouts, []),
-    S.readJSON(S.paths.planned, []),
-    S.readJSON(S.paths.status, null),
-  ]);
-  Object.assign(state, { athlete, weights, templates, workouts, planned, status });
-  await loadMonths(F.weekDates(state.date, F.isoDate(new Date())).concat(recentDates(21)));
+  const months = bootMonths();
+  const res = await S.bootstrap(months);
+  Object.assign(state, {
+    athlete: res.athlete,
+    weights: res.weight || [],
+    templates: res.templates || { meals: [], singles: [] },
+    workouts: res.workouts || [],
+    planned: res.planned || [],
+    status: res.status,
+  });
+  months.forEach((m) => state.loadedMonths.add(m));
+  absorbDays(res.days);
+  fillBlanks(F.weekDates(state.date, F.isoDate(new Date())).concat(recentDates(21)));
 }
 
 function recentDates(n) {
@@ -130,32 +142,32 @@ function recentDates(n) {
   return out;
 }
 
-/**
- * Load whole months and unpack them into per-day state. Sequential on purpose: three
- * requests in a row is well inside GitHub's burst allowance, where a fan-out of one
- * request per day was not.
- */
-async function loadMonths(dates) {
-  const months = [...new Set(dates.map((d) => d.slice(0, 7)))];
-  for (const m of months) {
-    if (state.months[m]) continue;
-    const file = (await S.readJSON(S.paths.month(m + '-01'), null)) || { month: m, days: {} };
-    state.months[m] = file;
-    for (const [date, day] of Object.entries(file.days || {})) {
-      state.logs[date] = { date, entries: [], confounders: [], notes: '', ...day };
-    }
+/** Unpack a `{ date: day }` map from the server into per-day state. */
+function absorbDays(days) {
+  for (const [date, day] of Object.entries(days || {})) {
+    state.logs[date] = { date, entries: [], confounders: [], notes: '', ...day };
   }
+}
+
+/** A date the server said nothing about is an empty day, not a missing one. */
+function fillBlanks(dates) {
   for (const d of new Set(dates)) {
     if (!state.logs[d]) state.logs[d] = { date: d, entries: [], confounders: [], notes: '' };
   }
 }
 
-async function flush() {
-  const before = S.pendingCount();
-  if (before) {
-    const { flushed } = await S.flushQueue(S.mergeMonth);
-    if (flushed) renderSyncBar();
+/** Pull in any month these dates touch that this session has not already loaded. */
+async function loadMonths(dates) {
+  const months = [...new Set(dates.map(S.monthOf))].filter((m) => !state.loadedMonths.has(m));
+  if (months.length) {
+    absorbDays(await S.loadMonths(months));
+    months.forEach((m) => state.loadedMonths.add(m));
   }
+  fillBlanks(dates);
+}
+
+async function flush() {
+  if (S.pendingCount()) await S.flushQueue();
   renderSyncBar();
 }
 
@@ -166,25 +178,18 @@ function ctx() {
 function today() { return state.logs[state.date] || { date: state.date, entries: [], confounders: [] }; }
 
 /**
- * Persist a day. `commit: false` updates state and the screen but queues nothing —
- * used for the second or two while a free-text entry is being estimated synchronously.
- * Writing a `pending` entry to GitHub in that window would fire the parse Action and
- * re-create the out-of-band race the Worker exists to remove.
+ * Persist a day. `commit: false` updates state and the screen but queues nothing — used
+ * for the second or two while a free-text entry is being estimated, so the row appears
+ * instantly and only the resolved version is ever written.
+ *
+ * The day arrives whole and `S.saveDay` works out which entries actually changed. Nothing
+ * here has to know about months any more: two devices editing the same day now touch
+ * different rows, so there is no file to read first and no merge to get right.
  */
 async function saveDay(day, { commit = true } = {}) {
-  const key = day.date.slice(0, 7);
-  // Never write a month file this device has not read. Building one from scratch queues a
-  // file holding a single day, and only the conflict handler stops that flattening the
-  // rest of the month on GitHub — far too much to rest on a path that runs this rarely.
-  if (!state.months[key]) await loadMonths([day.date]);
-
   state.logs[day.date] = day;
-  const month = state.months[key] || { month: key, days: {} };
-  const { date, ...rest } = day;
-  month.days = { ...month.days, [day.date]: rest };
-  state.months[key] = month;
   if (!commit) { render(); return; }
-  S.queueWrite(S.paths.month(day.date), month, `log: ${day.date}`);
+  S.saveDay(day.date, day);
   render();
   flush();
 }
@@ -246,17 +251,9 @@ function renderSyncBar() {
     bar.hidden = false;
     bar.className = 'sync-bar failed';
     const next = S.nextRetryAt();
-    bar.textContent = `${p} ${p === 1 ? 'change is' : 'changes are'} stuck on this phone and not reaching GitHub — ${stuck.lastError}.`
+    bar.textContent = `${p} ${p === 1 ? 'change is' : 'changes are'} stuck on this phone and not reaching the server — ${stuck.lastError}.`
       + (next ? ` Retrying ~${new Date(next).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.` : '')
-      + ' Tap to read GitHub anyway.';
-  } else if (S.rateLimitedUntil()) {
-    // The one state where a spinner genuinely has to wait. Say so, with a clock — the
-    // alternative is him watching "estimating" while GitHub refuses every read and the
-    // app looks broken. Everything is safe: writes retry, and parsed macros land when
-    // the limiter lifts.
-    bar.hidden = false;
-    bar.className = 'sync-bar pending';
-    bar.textContent = `GitHub is rate-limiting this account (all devices share it) — retrying until ~${new Date(S.rateLimitedUntil()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Everything logged is safe.`;
+      + ' Tap to check the server anyway.';
   } else if (p) {
     bar.hidden = false;
     bar.className = 'sync-bar pending';
@@ -270,7 +267,7 @@ function renderSyncBar() {
   // Always give him a way to force a read. Waiting on a timer to prove the app is not
   // broken is a bad place to leave someone who has just watched an entry not appear.
   bar.onclick = async () => {
-    bar.textContent = 'Checking GitHub…';
+    bar.textContent = 'Checking…';
     const changed = await refreshData({ force: true });
     if (!changed) { bar.textContent = 'Up to date'; setTimeout(renderSyncBar, 1500); }
   };
@@ -311,8 +308,8 @@ async function syncNow() {
 
   state.workouts = res.workouts;
   state.planned = res.planned;
-  S.queueWrite(S.paths.workouts, res.workouts, 'sync: workouts (from the app)');
-  S.queueWrite(S.paths.planned, res.planned, 'sync: planned (from the app)');
+  S.putWorkouts(res.workouts);
+  S.putPlanned(res.planned);
 
   // Weigh-ins from the Garmin scales, by way of TrainingPeaks. Union by date, and
   // anything already in the log wins: he only ever types a weight to correct one, and a
@@ -325,8 +322,12 @@ async function syncNow() {
     newWeighIns = before - (state.weights || []).filter((w) => res.weights.some((s) => s.date === w.date)).length;
     const merged = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
     if (JSON.stringify(merged) !== JSON.stringify(state.weights)) {
+      // Only the dates that actually moved. One op per date rather than one op for the
+      // whole list means a weigh-in typed on the desktop is not overwritten by a phone
+      // flushing a list it built before that weigh-in existed.
+      const had = new Map((state.weights || []).map((w) => [w.date, w.kg]));
+      S.putWeights(merged.filter((w) => had.get(w.date) !== w.kg));
       state.weights = merged;
-      S.queueWrite(S.paths.weight, merged, 'sync: weight (from the app)');
     }
   }
   // The staleness warning reads this. Without updating it, a successful sync leaves the
@@ -339,7 +340,7 @@ async function syncNow() {
     trainingpeaks_ok: true,
     source: 'app',
   };
-  S.queueWrite(S.paths.status, state.status, 'sync: status (from the app)');
+  S.putStatus(state.status);
 
   const done = res.workouts.filter((w) => w.date === F.isoDate(new Date())).length;
   out.textContent = `${res.workouts.length} workouts, ${res.planned.length} planned`
@@ -684,6 +685,9 @@ function renderEntries() {
 
       const del = el('button', 'e-del', '×');
       del.onclick = () => {
+        // Under GitHub this was the one edit that did not stick: the other device's copy
+        // of the month resurrected the entry on its next write, because a union of two
+        // JSON blobs cannot tell "deleted here" from "not seen here". It is a DELETE now.
         const day = { ...today(), entries: today().entries.filter((x) => x.id !== e.id) };
         saveDay(day);
       };
@@ -1071,7 +1075,7 @@ function renderSettings() {
     the evidence: copy it before reloading.</p>
     <pre id="debug-log" class="small" style="max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:var(--card,rgba(128,128,128,.08));border-radius:8px;padding:10px;font-size:11px;line-height:1.5">${escapeHtml([...S.dbgLines()].reverse().join('\n') || 'Nothing recorded yet.')}</pre>
     <button id="copy-debug" class="link-btn">Copy diagnostics</button>
-    <button id="signout" class="btn-primary" style="margin-top:14px;background:var(--bad)">Remove token from this device</button>`;
+    <button id="signout" class="btn-primary" style="margin-top:14px;background:var(--bad)">Remove key from this device</button>`;
   $('#copy-debug').onclick = async () => {
     try {
       await navigator.clipboard.writeText(S.dbgLines().join('\n'));
@@ -1084,18 +1088,18 @@ function renderSettings() {
     }
   };
   $('#signout').onclick = () => {
-    // Say what actually goes. This wipes the local copy of the log, not just the token.
+    // Say what actually goes. This wipes the local copy of the log, not just the key.
     const unsynced = S.unsyncedSummary();
     const warn = unsynced.length
-      ? `\n\n⚠️ ${unsynced.length} change${unsynced.length === 1 ? '' : 's'} on this phone ${unsynced.length === 1 ? 'has' : 'have'} NOT reached GitHub yet and will be lost:\n${unsynced.map((m) => '• ' + m).join('\n')}`
+      ? `\n\n⚠️ ${unsynced.length} change${unsynced.length === 1 ? '' : 's'} on this phone ${unsynced.length === 1 ? 'has' : 'have'} NOT reached the server yet and will be lost:\n${unsynced.map((m) => '• ' + m).join('\n')}`
       : '';
     const msg =
-      'Sign out of this device?\n\nThis deletes the token AND the local copy of your food log, ' +
-      'weight history and workouts from this phone. Everything already synced stays safe in ' +
-      'the private repo and comes back when you paste the token again.' + warn;
+      'Sign out of this device?\n\nThis deletes the key AND the local copy of your food log, ' +
+      'weight history and workouts from this phone. Everything already synced stays safe on ' +
+      'the server and comes back when you paste the key again.' + warn;
     if (!confirm(msg)) return;
-    const { cachedFiles } = S.clearToken();
-    console.info(`Cleared token, ${cachedFiles} cached files and the write queue.`);
+    const { cachedFiles } = S.clearKey();
+    console.info(`Cleared the key, ${cachedFiles} cached files and the write queue.`);
     location.reload();
   };
 }
@@ -1302,6 +1306,60 @@ let parseDeadline = 0;
 let tickInFlight = false;
 let lastTickAt = 0;
 
+// How many times one entry is re-estimated before the app stops asking. Past this it is
+// marked failed, which takes it out of `datesAwaitingParse` and stops the watch — the row
+// stays, with its text intact, and tapping it opens the editor so he can type the macros
+// or reword the food. An entry that retries forever is how a five-second poll ran for
+// sixteen hours.
+const PARSE_MAX_ATTEMPTS = 4;
+
+/**
+ * Re-estimate everything still pending. This is the fallback path, and it lives here now
+ * rather than in a GitHub Action.
+ *
+ * That is the real simplification of this migration. The Action was an out-of-band mutator
+ * with no push channel: it rewrote entries in a file the client was also writing, and the
+ * client had to poll to discover it. Every one of those words describes a bug that
+ * happened. Retrying from the device that owns the entry has neither property.
+ */
+async function retryPendingParses() {
+  const pending = [];
+  for (const date of datesAwaitingParse()) {
+    for (const e of state.logs[date].entries) {
+      if (e.source === 'freetext' && e.parse_state !== 'failed') pending.push({ date, entry: e });
+    }
+  }
+  if (!pending.length) return false;
+
+  const results = await S.parseText(
+    pending.map(({ date, entry }) => ({ id: entry.id, date, time: entry.time, text: entry.label })));
+
+  let changed = false;
+  for (const { date, entry } of pending) {
+    const resolved = applyEstimate(entry, results?.find((r) => r.id === entry.id));
+    let next;
+    if (resolved) {
+      next = resolved;
+      S.dbg(`entry ${entry.id} resolved on retry (${resolved.kcal} kcal)`);
+    } else {
+      const attempts = (entry.parse_attempts || 1) + 1;
+      next = { ...entry, parse_attempts: attempts };
+      if (attempts >= PARSE_MAX_ATTEMPTS) {
+        next.parse_state = 'failed';
+        next.parse_error = 'could not estimate this one — tap to fill it in';
+        S.dbg(`entry ${entry.id} gave up after ${attempts} attempts`);
+      }
+    }
+    const day = state.logs[date];
+    const entries = day.entries.map((e) => (e.id === entry.id ? next : e));
+    state.logs[date] = { ...day, entries };
+    S.saveDay(date, state.logs[date]);
+    changed = true;
+  }
+  if (changed) flush();
+  return changed;
+}
+
 /** Every loaded day still holding an entry the parser hasn't resolved. */
 function datesAwaitingParse() {
   return Object.entries(state.logs)
@@ -1361,74 +1419,31 @@ async function parseTick() {
     // held the window open indefinitely, logging the same line every five seconds for
     // sixteen hours, while the answer sat on GitHub the whole time. Hand those to
     // refreshData, which reads past a stuck write and merges.
+    // Nothing rewrites an entry behind the app's back any more — the estimate arrives in
+    // the response to the write, and a fallback entry stays pending until this device
+    // retries it. So the watcher's job shrank to flushing the queue and re-rendering the
+    // "still estimating" counter, and the whole class of "poll GitHub to discover what the
+    // Action did to my file" is gone.
     if (S.pendingCount()) {
-      if (!S.stuckWrite()) {
-        if (Date.now() - parseStartedAt > PARSE_MAX_LIFE_MS) {
-          S.dbg(`parse tick: giving up after ${Math.round((Date.now() - parseStartedAt) / 60000)}min with a write still queued — the 5-minute refresh takes it from here`);
-          return stopWatch();
-        }
-        S.dbg(`parse tick: ${S.pendingCount()} write(s) still queued, holding window open`);
-        parseDeadline = Date.now() + PARSE_WINDOW_MS;
-        return reschedule();
-      }
-      S.dbg(`parse tick: ${S.pendingCount()} write(s) stuck — reading GitHub anyway`);
-      if (await refreshData({ force: true })) render();
-      if (!datesAwaitingParse().length) {
-        S.dbg('parse tick: resolved from GitHub despite the stuck write, stopping watch');
+      if (Date.now() - parseStartedAt > PARSE_MAX_LIFE_MS) {
+        S.dbg(`parse tick: giving up after ${Math.round((Date.now() - parseStartedAt) / 60000)}min with a write still queued — the 5-minute refresh takes it from here`);
         return stopWatch();
       }
+      S.dbg(`parse tick: ${S.pendingCount()} write(s) still queued, holding window open`);
+      parseDeadline = Date.now() + PARSE_WINDOW_MS;
+      await flush();
       return reschedule();
     }
 
-    let changed = false;
-    for (const m of new Set(datesAwaitingParse().map((d) => d.slice(0, 7)))) {
-      const path = S.paths.month(m + '-01');
-      let got;
-      try { got = await S.peekJSON(path); } catch (e) { S.dbg(`parse tick: peek ${path} threw — ${e?.message || e}`); continue; }
-      if (!got) continue;
-
-      // A write queued while that fetch was in flight makes the response stale the instant
-      // it arrives. Adopting it would overwrite the entry just logged, and the queued job
-      // would then push the overwritten file. Drop it and come back next tick.
-      if (S.pendingCount()) return reschedule();
-
-      // Only worth a log line when the file actually moved — that one line separates
-      // "the watcher polled and GitHub kept serving the pre-parse copy" from "the
-      // watcher never looked at all", which no amount of repo archaeology could do.
-      const before = S.cachedSha(path);
-      if (got.sha !== before) S.dbg(`parse tick: ${path} changed ${String(before).slice(0, 7)} → ${got.sha.slice(0, 7)}, adopting`);
-
-      S.adopt(path, got.value, got.sha);
-      state.months[m] = got.value;
-      for (const [d, day] of Object.entries(got.value.days || {})) {
-        state.logs[d] = { date: d, entries: [], confounders: [], notes: '', ...day };
-      }
-      changed = true;
-    }
+    // Everything on this device has landed, so anything still unresolved is an entry whose
+    // estimate failed. Ask again — this is the fallback now, in place of the Action.
+    const retried = await retryPendingParses();
     if (!datesAwaitingParse().length) {
       S.dbg('parse tick: resolved, stopping watch');
-      if (changed) render();
+      render();
       return stopWatch();
     }
-
-    // A rate-limited GitHub refuses reads for ~10 minutes, which is longer than the
-    // whole watch window — the first real incident burned all 18 ticks on 403s and then
-    // expired, leaving a spinner over an entry that had been parsed for ages. Refused
-    // reads must not count against the window: hold it open until the limiter clears,
-    // and poll gently, because hammering a secondary limit extends the ban.
-    const limitedUntil = S.rateLimitedUntil();
-    if (limitedUntil) {
-      if (Date.now() - parseStartedAt > PARSE_MAX_LIFE_MS) {
-        S.dbg('parse tick: giving up — rate-limited for longer than the watch is allowed to live');
-        return stopWatch();
-      }
-      if (parseDeadline < limitedUntil) {
-        S.dbg(`parse tick: rate-limited, backing off to 60s ticks until ~${new Date(limitedUntil).toLocaleTimeString()}`);
-        parseDeadline = limitedUntil + PARSE_WINDOW_MS;
-      }
-      render();
-      return reschedule(60000);
-    }
+    if (retried) render();
 
     // Re-render even when nothing arrived, so the "still estimating after Ns" counter is
     // honest about how long he has actually been waiting.
@@ -1508,66 +1523,58 @@ async function recheckNow() {
 async function refreshData({ force = false } = {}) {
   if (!force && Date.now() - lastRefresh < REFRESH_MIN_GAP_MS) return false;
 
-  // A queued write normally blocks reads: adopting the remote copy over the top of an
-  // entry that has not been sent yet would lose it, and the queued job would then push
-  // the clobbered file back.
+  // A queued write still blocks the read, for the same reason as before: this device's
+  // unsent work is not on the server yet, so adopting the server's copy over the top of it
+  // would drop it from the screen until the flush caught up.
   //
-  // But a write that has failed repeatedly is not "not sent yet", it is stuck — and
-  // blocking reads on it means the app can sit for sixteen hours showing spinners for
-  // entries GitHub has already parsed, unable even to look. That happened. So once a
-  // write is stuck we do read, and MERGE rather than adopt, which keeps the unsent work
-  // and picks up everything else. The merge also repairs the queued write: it comes back
-  // holding the current sha, which is usually what unsticks it.
-  // Every read while rate-limited is a request spent on a guaranteed 403. Two of them
-  // every five minutes is nothing against a 5,000/hr quota and a large fraction of a
-  // 60/hr one — and it is exactly the behaviour that keeps a small quota pinned at zero.
-  // A forced tap still goes through: he may have a reason to believe it has cleared.
-  if (!force && S.rateLimitedUntil()) return false;
-
-  const stuck = !!S.stuckWrite();
-  if (S.pendingCount() && !stuck) {
-    if (force) S.dbg(`refresh skipped: ${S.pendingCount()} write(s) still queued`);
-    return false;
+  // What changed is that this is now a display concern rather than a data one. Under
+  // GitHub the queued write held a whole month file, so reading past it and then flushing
+  // would push a copy missing everything the other device had done. The queue holds
+  // entry-level ops now — flushing after a read applies them to the current rows, and
+  // nothing else in the month is touched. So flush first and then read, instead of
+  // refusing to look.
+  if (S.pendingCount()) {
+    if (force) {
+      S.dbg(`refresh: flushing ${S.pendingCount()} queued write(s) first`);
+      await S.flushQueue();
+    }
+    if (S.pendingCount()) return false;
   }
-  if (stuck) S.dbg(`refresh: reading despite ${S.pendingCount()} stuck write(s), will merge`);
   lastRefresh = Date.now();
 
-  const monthKeys = new Set([state.date.slice(0, 7), F.isoDate(new Date()).slice(0, 7)]);
+  const months = [...new Set([S.monthOf(state.date), S.monthOf(F.isoDate(new Date()))])];
   let changed = false;
 
-  for (const m of monthKeys) {
-    const path = S.paths.month(m + '-01');
-    let got;
-    try { got = await S.peekJSON(path); } catch { continue; }
-    if (!got) continue;
-    // A write landed mid-fetch — leave it alone. Unless it is the stuck one we already
-    // decided to read past, which is still queued by definition.
-    if (S.pendingCount() && !stuck) continue;
-
-    const next = stuck ? S.mergeMonth(path, got.value, state.months[m]) : got.value;
-    if (stuck && JSON.stringify(next) === JSON.stringify(got.value)) {
-      // Everything the stuck write wanted to say is already on GitHub. Almost always this
-      // is pending entries the parser has since resolved: the queued job has been fighting
-      // to replace good data with worse. Let it go.
-      S.discardWrite(path);
+  const got = await S.peekMonths(months);
+  if (got) {
+    // A write queued while that fetch was in flight makes the response stale the instant
+    // it arrives. Come back next time rather than showing him a day without it.
+    if (!S.pendingCount()) {
+      S.adoptMonths(months, got.days);
+      // Days the server no longer has anything to say about. Without this an entry deleted
+      // on the phone stays on the desktop's screen forever: the response simply omits the
+      // day, and merging omissions is exactly the mistake the old model made.
+      for (const d of Object.keys(state.logs)) {
+        if (months.includes(S.monthOf(d)) && !got.days[d] && state.logs[d].entries.length) {
+          state.logs[d] = { date: d, entries: [], confounders: [], notes: '' };
+          changed = true;
+        }
+      }
+      for (const [d, day] of Object.entries(got.days)) {
+        const next = { date: d, entries: [], confounders: [], notes: '', ...day };
+        if (JSON.stringify(state.logs[d]) === JSON.stringify(next)) continue;
+        state.logs[d] = next;
+        changed = true;
+      }
     }
-    if (JSON.stringify(state.months[m]) === JSON.stringify(next)) continue;
-    S.adopt(path, next, got.sha);
-    state.months[m] = next;
-    for (const [d, day] of Object.entries(next.days || {})) {
-      state.logs[d] = { date: d, entries: [], confounders: [], notes: '', ...day };
-    }
-    changed = true;
   }
 
-  try {
-    const w = await S.peekJSON(S.paths.weight);
-    if (w && (!S.pendingCount() || stuck) && JSON.stringify(w.value) !== JSON.stringify(state.weights)) {
-      S.adopt(S.paths.weight, w.value, w.sha);
-      state.weights = w.value;
-      changed = true;
-    }
-  } catch { /* the log matters more; a stale weight is visible in the UI anyway */ }
+  const docs = await S.peekDocs();
+  if (docs && !S.pendingCount() && JSON.stringify(docs.weight) !== JSON.stringify(state.weights)) {
+    S.adoptDoc('weight', docs.weight);
+    state.weights = docs.weight;
+    changed = true;
+  }
 
   if (changed) { S.dbg(`refresh: remote changes adopted${force ? ' (forced)' : ''}`); render(); }
   return changed;
@@ -1606,10 +1613,9 @@ function logWeight() {
   const box = boxes.find((b) => b.value !== '');
   const kg = Number(box?.value);
   if (!kg || kg < 40 || kg > 200) return;
-  const weights = [...state.weights.filter((w) => w.date !== state.date), { date: state.date, kg }]
+  state.weights = [...state.weights.filter((w) => w.date !== state.date), { date: state.date, kg }]
     .sort((a, b) => a.date.localeCompare(b.date));
-  state.weights = weights;
-  S.queueWrite(S.paths.weight, weights, `weight: ${state.date} ${kg}kg`);
+  S.putWeight(state.date, kg);
   boxes.forEach((b) => (b.value = ''));
   render();
   flush();

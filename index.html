@@ -15,25 +15,21 @@
 </head>
 <body>
 
-<!-- Token gate: everything above this is public, nothing below it renders without a token -->
+<!-- Key gate: everything above this is public, nothing below it renders without the key -->
 <section id="gate" class="gate" hidden>
   <div class="gate-card">
     <h1>Fuel</h1>
-    <p class="muted">This page is code only. Your data lives in a private repo and needs a token to read.</p>
-    <label for="token-input">GitHub fine-grained token</label>
+    <p class="muted">This page is code only. Your data lives behind the fuel Worker and needs the key to read.</p>
+    <label for="token-input">Fuel key</label>
     <input id="token-input" type="password" inputmode="text" autocomplete="off"
-           autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="github_pat_…">
+           autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="paste the key">
     <button id="token-save" class="btn-primary">Unlock</button>
     <p id="token-error" class="error" hidden></p>
     <details>
-      <summary>How to make one</summary>
-      <ol>
-        <li>github.com → Settings → Developer settings</li>
-        <li>Personal access tokens → Fine-grained tokens → Generate new token</li>
-        <li>Repository access → Only select repositories → <code>fuel-data</code></li>
-        <li>Permissions → Repository permissions → Contents → <strong>Read and write</strong></li>
-        <li>Generate, copy, paste above</li>
-      </ol>
+      <summary>Where it comes from</summary>
+      <p class="muted">It is the <code>FUEL_SECRET</code> set on the Worker. Paste the same
+      value on every device. To rotate it, run <code>wrangler secret put FUEL_SECRET</code>
+      with a new value and paste that one instead — there is nothing else to revoke.</p>
     </details>
   </div>
 </section>

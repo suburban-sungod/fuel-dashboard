@@ -1,19 +1,26 @@
-// store.js — talks to the private fuel-data repo through the GitHub API.
-// Reads are cached locally so the app opens instantly and works offline.
-// Writes are queued locally first, so logging a meal never waits on the network.
-
-const OWNER = 'suburban-sungod';
-const REPO = 'fuel-data';
-const API = 'https://api.github.com';
+// store.js — talks to the fuel Worker, which holds the data in D1.
+//
+// Reads are cached locally so the app opens instantly and works offline. Writes are queued
+// locally first, so logging a meal never waits on the network. Both of those survive from
+// the GitHub version and are the reason the app works on a ride with no signal.
+//
+// What changed is the unit of work. It used to read and write whole month FILES, and carry
+// a sha, a merge rule, and a rule for preferring one copy of an entry over another. All of
+// that existed to survive two devices editing one blob. The queue now holds OPERATIONS —
+// put this entry, delete that one, close this day — and the server applies them to rows.
+// Two devices logging into the same day touch different rows and cannot conflict, and a
+// delete is finally a delete rather than something a union has to infer.
 
 const LS = {
-  token: 'fuel.token',
+  key: 'fuel.key',
   cache: 'fuel.cache.',
   queue: 'fuel.queue',
   lastSync: 'fuel.lastSync',
   debug: 'fuel.debug',
-  parseUrl: 'fuel.parseUrl',
+  apiUrl: 'fuel.apiUrl',
 };
+
+const API = 'https://fuel-parse.shadesofjade.workers.dev';
 
 // ---------- diagnostics ----------
 //
@@ -44,40 +51,32 @@ export function dbgLines() {
   }
 }
 
-// ---------- base64 that survives non-ASCII ----------
+// ---------- the key ----------
+//
+// One long random secret, held as a Worker secret and pasted once per device. It replaces
+// the GitHub PAT in the same slot, with the same sign-out semantics.
+//
+// Worth being clear about what this is not: it is not a step up in security. The PAT was
+// stronger and that was the problem — it also unlocked the GitHub account that runs a
+// company, so a runaway client here could and did take that down. This key unlocks one
+// Worker holding one food log. Rotating it is one command and one paste per device.
 
-function b64decode(s) {
-  const bin = atob(s.replace(/\s/g, ''));
-  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
-  return new TextDecoder().decode(bytes);
+export function getKey() {
+  return localStorage.getItem(LS.key) || '';
 }
 
-function b64encode(str) {
-  const bytes = new TextEncoder().encode(str);
-  let bin = '';
-  bytes.forEach((b) => (bin += String.fromCharCode(b)));
-  return btoa(bin);
-}
-
-// ---------- token ----------
-
-export function getToken() {
-  return localStorage.getItem(LS.token) || '';
-}
-
-export function setToken(t) {
-  localStorage.setItem(LS.token, (t || '').trim());
+export function setKey(k) {
+  localStorage.setItem(LS.key, (k || '').trim());
 }
 
 /**
- * Remove the token AND everything it fetched. The cache holds the full food log, the
- * weight history and the workouts in plain text — leaving it behind means a button
- * labelled "remove the token" quietly leaves all the private data on the device, which
- * defeats the entire reason the data lives in a separate private repo.
+ * Remove the key AND everything it fetched. The cache holds the full food log, the weight
+ * history and the workouts in plain text — leaving it behind means a button labelled
+ * "remove the key" quietly leaves all the private data on the device.
  *
  * Returns what it deleted so the UI can say so honestly.
  */
-export function clearToken() {
+export function clearKey() {
   // length/key() rather than Object.keys: it is the actual Storage API, so it behaves the
   // same everywhere and is testable outside a browser.
   const cacheKeys = [];
@@ -87,345 +86,266 @@ export function clearToken() {
   }
   const dropped = pendingCount();
   cacheKeys.forEach((k) => localStorage.removeItem(k));
-  [LS.token, LS.queue, LS.lastSync, LS.debug].forEach((k) => localStorage.removeItem(k));
+  [LS.key, LS.queue, LS.lastSync, LS.debug].forEach((k) => localStorage.removeItem(k));
   return { cachedFiles: cacheKeys.length, unsyncedWrites: dropped };
 }
 
-/** Anything logged on this device that has not reached GitHub yet. */
+/** Anything logged on this device that has not reached the server yet. */
 export function unsyncedSummary() {
-  return getQueue().map((j) => j.message || j.path);
+  return getQueue().map((j) => j.label || j.key);
 }
 
-export async function verifyToken(token) {
-  const res = await fetch(`${API}/repos/${OWNER}/${REPO}`, {
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' },
-  });
+/** Where the Worker lives. The override exists so failure paths can be exercised for real. */
+export function apiUrl() {
+  const override = localStorage.getItem(LS.apiUrl);
+  return (override != null ? override : API).trim().replace(/\/$/, '');
+}
+
+export function setApiUrl(url) {
+  if (url == null) localStorage.removeItem(LS.apiUrl);
+  else localStorage.setItem(LS.apiUrl, String(url).trim());
+}
+
+/**
+ * One HTTP call to the Worker, with the key attached and errors turned into thrown
+ * Errors carrying the server's own words.
+ *
+ * The server's reason is always surfaced. A bare status code sends you hunting blind —
+ * that lesson cost three debugging sessions under the previous backend.
+ */
+async function call(path, { method = 'GET', body, timeoutMs = 20000 } = {}) {
+  const key = getKey();
+  if (!key) throw new Error('No key on this device.');
+
+  const ctrl = new AbortController();
+  // AbortSignal.timeout is not in older iOS Safari, and this runs on a phone.
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(apiUrl() + path, {
+      method,
+      headers: {
+        Authorization: `Bearer ${key}`,
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+      cache: 'no-store',
+      signal: ctrl.signal,
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const err = new Error(payload.error || `server returned ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    return payload;
+  } catch (e) {
+    if (e?.name === 'AbortError') {
+      const err = new Error(`timed out after ${timeoutMs}ms`);
+      err.timeout = true;
+      throw err;
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The gate screen's check. Throws with something readable if the key is no good. */
+export async function verifyKey(key) {
+  const res = await fetch(`${apiUrl()}/ping`, { headers: { Authorization: `Bearer ${key}` } });
   if (res.ok) return true;
-
-  // Surface GitHub's own reason — a bare status code sends you hunting blind.
   let detail = '';
-  try { detail = (await res.json())?.message || ''; } catch { /* body may be empty */ }
-
-  if (res.status === 401) {
-    throw new Error('Token rejected — check it pasted whole, with no trailing space, and has not expired.');
-  }
-  if (res.status === 404) {
-    throw new Error(`Token works but cannot see ${OWNER}/${REPO}. Re-issue it with that repo selected under "Only select repositories".`);
-  }
-  if (res.status === 403) {
-    if (res.headers.get('x-ratelimit-remaining') === '0') {
-      const reset = Number(res.headers.get('x-ratelimit-reset') || 0) * 1000;
-      throw new Error(`GitHub rate limit hit. Try again after ${new Date(reset).toLocaleTimeString()}.`);
-    }
-    throw new Error(
-      `GitHub refused the token (403). Usual cause: the token is missing "Metadata: Read-only", ` +
-      `which fine-grained tokens need on top of Contents. Check it is a fine-grained token, ` +
-      `scoped to ${REPO}, with Contents: Read and write.` + (detail ? ` GitHub said: ${detail}` : '')
-    );
-  }
-  throw new Error(`GitHub returned ${res.status}.` + (detail ? ` ${detail}` : ''));
-}
-
-// ---------- synchronous parsing ----------
-//
-// The Worker (source in the private fuel-data repo, `worker/`) estimates macros in the
-// HTTP response, so an entry can be written to GitHub once, already resolved. That deletes
-// the entire "client must discover an out-of-band mutation" problem — the GitHub Action
-// rewriting entries in place, and the client polling to notice, is what failed four
-// separate ways in one day.
-//
-// The Action path is still there and still correct. Every failure here — a bad response, a
-// timeout, no signal, no configured URL — falls back to it. Nothing in this file is a
-// secret: the endpoint is public and useless without the GitHub token the caller presents.
-
-const PARSE_URL = 'https://fuel-parse.shadesofjade.workers.dev/parse';
-// Observed round trips: 5.2s, 7.3s, 8.0s, and one that ran past 10s and fell back. The
-// original 10s was set from an assumed 1-2s and left almost no headroom, so an estimate
-// that was on its way got thrown away and the entry went to the slow path instead.
-// Giving up early costs more than waiting: the row sits there either way, but a timeout
-// also spends a GitHub write, a workflow run and a second Anthropic call.
-const PARSE_TIMEOUT_MS = 20000;
-
-/**
- * The parse endpoint, or '' if there isn't one. The localStorage override exists so the
- * fallback path can be exercised for real — point it at a dead host and log something —
- * without deleting the Worker.
- */
-export function parseUrl() {
-  const override = localStorage.getItem(LS.parseUrl);
-  if (override != null) return override.trim();
-  return PARSE_URL.includes('__SUBDOMAIN__') ? '' : PARSE_URL;
-}
-
-export function setParseUrl(url) {
-  if (url == null) localStorage.removeItem(LS.parseUrl);
-  else localStorage.setItem(LS.parseUrl, String(url).trim());
-}
-
-/**
- * Estimate macros for free-text entries, synchronously.
- *
- * Returns an array of results, or **null** meaning "this did not work, use the async
- * path". Never throws and never rejects: the caller's fallback is the whole safety net,
- * so a thrown error here would be an outage rather than a degradation.
- */
-export async function parseText(entries, timeoutMs = PARSE_TIMEOUT_MS) {
-  const url = parseUrl();
-  const token = getToken();
-  if (!url || !token || !entries?.length) {
-    dbg(`parse: skipped (${!url ? 'no endpoint' : !token ? 'no token' : 'nothing to parse'})`);
-    return null;
-  }
-  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-    dbg('parse: offline, falling back to the async parser');
-    return null;
-  }
-
-  const started = Date.now();
-  // AbortSignal.timeout is not in older iOS Safari, and this runs on a phone. A manual
-  // controller is two more lines and works everywhere.
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ entries }),
-      signal: ctrl.signal,
-    });
-    if (!res.ok) {
-      let why = '';
-      try { why = (await res.json())?.error || ''; } catch { /* body may be empty */ }
-      dbg(`parse: HTTP ${res.status}${why ? ` (${why})` : ''} after ${Date.now() - started}ms, falling back`);
-      return null;
-    }
-    const out = (await res.json())?.entries;
-    if (!Array.isArray(out) || !out.length) {
-      dbg('parse: response had no estimates, falling back');
-      return null;
-    }
-    dbg(`parse: resolved ${out.length} in ${Date.now() - started}ms`);
-    return out;
-  } catch (e) {
-    const reason = e?.name === 'AbortError' ? `timed out after ${timeoutMs}ms` : e?.message || 'failed';
-    dbg(`parse: ${reason}, falling back to the async parser`);
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * Pull training data from TrainingPeaks, now, through the Worker.
- *
- * `sync.py` runs hourly on the Mac and cannot be reached from a page on GitHub Pages, so
- * "sync now" used to be impossible: an hour-old plan was an hour-old plan. TrainingPeaks
- * the Worker can reach directly, and it carries everything the app reads off a workout.
- *
- * Returns `{ workouts, planned }` on success, or `{ error }` — this one reports its
- * failure rather than degrading silently, because the whole point is that he pressed a
- * button and is waiting to see whether it worked.
- */
-export async function syncTraining(timeoutMs = 30000) {
-  const url = parseUrl().replace(/\/parse$/, '/sync');
-  const token = getToken();
-  if (!url || !token) return { error: 'no sync endpoint configured' };
-
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-      signal: ctrl.signal,
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      dbg(`sync: HTTP ${res.status} (${body.error || 'no reason given'})`);
-      return { error: body.error || `sync failed (${res.status})` };
-    }
-    if (!Array.isArray(body.workouts) || !Array.isArray(body.planned)) {
-      dbg('sync: response was the wrong shape');
-      return { error: 'TrainingPeaks returned nothing usable' };
-    }
-    dbg(`sync: ${body.workouts.length} workouts, ${body.planned.length} planned`);
-    return { workouts: body.workouts, planned: body.planned };
-  } catch (e) {
-    const reason = e?.name === 'AbortError' ? 'timed out' : e?.message || 'failed';
-    dbg(`sync: ${reason}`);
-    return { error: `Could not reach the sync service — ${reason}.` };
-  } finally {
-    clearTimeout(timer);
-  }
+  try { detail = (await res.json())?.error || ''; } catch { /* body may be empty */ }
+  if (res.status === 401) throw new Error(detail || 'Key rejected — check it pasted whole, with no trailing space.');
+  if (res.status === 500) throw new Error(detail || 'The server is missing its own configuration.');
+  throw new Error(`The server returned ${res.status}.${detail ? ` ${detail}` : ''}`);
 }
 
 // ---------- local cache ----------
+//
+// Keyed by month for the log and by name for everything else, mirroring how the app reads
+// them. There is no sha and nothing to reconcile: the cache is a copy of what the server
+// said last, plus whatever this device has queued on top.
 
-function cacheGet(path) {
+function cacheGet(k) {
   try {
-    const raw = localStorage.getItem(LS.cache + path);
-    return raw ? JSON.parse(raw) : null;
+    const raw = localStorage.getItem(LS.cache + k);
+    return raw ? JSON.parse(raw).value : null;
   } catch {
     return null;
   }
 }
 
-function cacheSet(path, value, sha) {
-  localStorage.setItem(LS.cache + path, JSON.stringify({ value, sha, at: Date.now() }));
+function cacheSet(k, value) {
+  try {
+    localStorage.setItem(LS.cache + k, JSON.stringify({ value, at: Date.now() }));
+  } catch (e) {
+    // A full quota must not lose the write that is already queued. Say so and carry on:
+    // the op is durable in the queue, only the offline copy is degraded.
+    dbg(`cache: could not store ${k} — ${e?.message || e}`);
+  }
 }
+
+const monthKey = (m) => `days.${m}`;
+const docKey = (name) => `doc.${name}`;
 
 export function lastSync() {
   const v = localStorage.getItem(LS.lastSync);
   return v ? Number(v) : null;
 }
 
+function markSynced() {
+  localStorage.setItem(LS.lastSync, String(Date.now()));
+}
+
+/** '2026-08-04' → '2026-08'. */
+export const monthOf = (iso) => iso.slice(0, 7);
+
+function monthBounds(months) {
+  const sorted = [...months].sort();
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1];
+  const [y, m] = last.split('-').map(Number);
+  // Day 0 of the next month is the last day of this one, and gets February right.
+  const end = new Date(Date.UTC(y, m, 0));
+  return { from: `${first}-01`, to: end.toISOString().slice(0, 10) };
+}
+
+function splitByMonth(days) {
+  const out = {};
+  for (const [date, day] of Object.entries(days || {})) (out[monthOf(date)] ||= {})[date] = day;
+  return out;
+}
+
+/** Write a fetched span into the per-month caches, including months that came back empty. */
+function cacheMonths(months, days) {
+  const byMonth = splitByMonth(days);
+  for (const m of months) cacheSet(monthKey(m), byMonth[m] || {});
+}
+
 // ---------- reads ----------
 
 /**
- * Read a JSON file. Returns the cached copy immediately if the network fails,
- * so a dead connection degrades to stale data rather than a blank screen.
+ * Everything the app needs at boot, in one request.
+ *
+ * Under GitHub this was six round trips before a single day could be drawn, plus one per
+ * month of log. One call is not really an optimisation — it is the removal of a set of
+ * half-loaded states where the profile had arrived and the log had not.
+ *
+ * Falls back to the cache whole. A dead connection degrades to stale data, never a blank
+ * screen.
  */
-export async function readJSON(path, fallback = null) {
-  const token = getToken();
-  const cached = cacheGet(path);
-  if (!token) return cached ? cached.value : fallback;
-
+export async function bootstrap(months) {
+  const { from, to } = monthBounds(months);
   try {
-    const res = await fetch(`${API}/repos/${OWNER}/${REPO}/contents/${path}`, {
-      headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' },
-      cache: 'no-store',
-    });
-    if (res.status === 404) {
-      // Only treat a 404 as "this file does not exist" the first time. Once there is a
-      // cached copy, a 404 is far more likely to be a token that lost access than a file
-      // that vanished — and caching the fallback over real data throws the log away.
-      if (cached) return cached.value;
-      cacheSet(path, fallback, null);
-      return fallback;
+    const res = await call(`/data/bootstrap?from=${from}&to=${to}`);
+    cacheMonths(months, res.days);
+    for (const name of ['athlete', 'templates', 'weight', 'workouts', 'planned', 'status']) {
+      cacheSet(docKey(name), res[name]);
     }
-    if (!res.ok) throw new Error(`GitHub ${res.status}`);
-    const meta = await res.json();
-    const value = JSON.parse(b64decode(meta.content));
-    cacheSet(path, value, meta.sha);
-    localStorage.setItem(LS.lastSync, String(Date.now()));
-    return value;
-  } catch (err) {
-    if (cached) return cached.value;
-    throw err;
+    markSynced();
+    dbg(`boot: loaded ${Object.keys(res.days || {}).length} days over ${months.length} month(s)`);
+    return { ...res, days: res.days || {} };
+  } catch (e) {
+    dbg(`boot: ${e.message} — using the cached copy`);
+    const cached = {
+      athlete: cacheGet(docKey('athlete')),
+      templates: cacheGet(docKey('templates')) || { meals: [], singles: [] },
+      weight: cacheGet(docKey('weight')) || [],
+      workouts: cacheGet(docKey('workouts')) || [],
+      planned: cacheGet(docKey('planned')) || [],
+      status: cacheGet(docKey('status')),
+      days: cachedDays(months),
+      offline: true,
+    };
+    // With no profile there is nothing to compute against and the app says so at the gate.
+    // Rethrowing only when the cache is empty keeps a bad link from looking like a failure.
+    if (!cached.athlete) throw e;
+    return cached;
   }
 }
 
-export function cachedSha(path) {
-  return cacheGet(path)?.sha ?? null;
+function cachedDays(months) {
+  const days = {};
+  for (const m of months) Object.assign(days, cacheGet(monthKey(m)) || {});
+  return days;
 }
 
 /**
- * Read straight from GitHub without touching the local cache, and without falling back
- * to it. The parse watcher needs this: `readJSON` caches what it reads, so an entry
- * logged while a read was in flight would be overwritten by the response, and the write
- * already queued for it would then push the clobbered file back to GitHub.
- *
- * The caller decides when it is safe to keep the result — see `adopt`.
+ * Load whole months, from cache where we have them and the server for the rest.
+ * Used when he pages back past what boot loaded.
  */
-export async function peekJSON(path) {
-  const token = getToken();
-  if (!token) return null;
-  const res = await fetch(`${API}/repos/${OWNER}/${REPO}/contents/${path}`, {
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' },
-    cache: 'no-store',
-  });
-  if (!res.ok) {
-    // A null here is indistinguishable from "file missing" to the caller, and a 403 from
-    // the secondary rate limiter looks exactly like a token problem. Record which it was.
-    if (res.status === 403 && (res.headers.get('retry-after') || res.headers.get('x-ratelimit-remaining') === '0')) noteRateLimit(res);
-    // `remaining 0` alone cannot tell the two possible causes apart, and they need
-    // opposite fixes. A LIMIT of 60 means GitHub is treating these reads as anonymous —
-    // the token is not arriving — and no amount of backing off will help. A limit of
-    // 5000 means something really is making thousands of requests an hour on this token.
-    // Log the limit and the resource so the next occurrence answers the question itself.
-    const lim = res.headers.get('x-ratelimit-limit');
-    const used = res.headers.get('x-ratelimit-used');
-    const resource = res.headers.get('x-ratelimit-resource');
-    dbg(`peek ${path}: HTTP ${res.status}${res.status === 403
-      ? ` (used ${used}/${lim} of "${resource}", remaining ${res.headers.get('x-ratelimit-remaining')}, clears ~${new Date(rateLimitedUntil()).toLocaleTimeString()})`
-      : ''}`);
+export async function loadMonths(months) {
+  const missing = months.filter((m) => cacheGet(monthKey(m)) === null);
+  if (missing.length) {
+    const { from, to } = monthBounds(missing);
+    try {
+      const res = await call(`/data/days?from=${from}&to=${to}`);
+      cacheMonths(missing, res.days);
+      markSynced();
+    } catch (e) {
+      dbg(`load ${missing.join(',')}: ${e.message}`);
+    }
+  }
+  return cachedDays(months);
+}
+
+/**
+ * Read the server without touching the cache, so the caller decides whether to keep it.
+ * Returns `{ days }`, or null if the read failed.
+ *
+ * Unlike the GitHub version this does NOT have to be paired with a merge. A refresh that
+ * arrives while a write is queued is simply the server's current truth for rows this
+ * device has not changed; the queued ops are applied on top when they flush.
+ */
+export async function peekMonths(months) {
+  const { from, to } = monthBounds(months);
+  try {
+    const res = await call(`/data/days?from=${from}&to=${to}`);
+    return { days: res.days || {} };
+  } catch (e) {
+    dbg(`peek ${months.join(',')}: ${e.message}`);
     return null;
   }
-  noteQuota(res, path);
-  clearRateLimit();
-  const meta = await res.json();
-  return { value: JSON.parse(b64decode(meta.content)), sha: meta.sha };
 }
 
-// ---------- rate limiting ----------
-//
-// GitHub's SECONDARY (abuse) limiter is per account, shared by every device and script
-// using it, and reports itself in the same words as the hourly quota while the hourly
-// quota sits untouched. When it bites, every read 403s for ~10 minutes, and continuing
-// to hammer it extends the ban. The app needs to know it is in that state so the
-// watcher can back off and the sync bar can say what is actually happening.
+/** Accept a peeked span into the cache. */
+export function adoptMonths(months, days) {
+  cacheMonths(months, days);
+  markSynced();
+}
 
-let rateLimitUntil = 0;
-
-// What the quota looked like on the last successful read. Logged when it first appears
-// and whenever it gets low, because "remaining 0" on a 403 never said which quota was
-// exhausted — and a LIMIT of 60 (anonymous) versus 5000 (this token) is the whole
-// diagnosis. Cheap: it is reading headers off a response we already have.
-let quotaSeen = null;
-
-function noteQuota(res, path) {
-  const limit = Number(res.headers.get('x-ratelimit-limit') || 0);
-  const remaining = Number(res.headers.get('x-ratelimit-remaining') || 0);
-  if (!limit) return;
-  const first = quotaSeen?.limit !== limit;
-  quotaSeen = { limit, remaining, at: Date.now() };
-  if (first || remaining < 50 || remaining % 500 === 0) {
-    dbg(`quota: ${remaining}/${limit} left on "${res.headers.get('x-ratelimit-resource')}" after reading ${path}`
-      + (limit <= 60 ? ' — a limit this low means GitHub is treating these reads as ANONYMOUS' : ''));
+/**
+ * Everything that is not the log: the profile, templates, weight, workouts, planned and
+ * the sync status. One call, because they are small and always wanted together.
+ */
+export async function peekDocs() {
+  try {
+    return await call('/data/docs');
+  } catch (e) {
+    dbg(`peek docs: ${e.message}`);
+    return null;
   }
 }
 
-/** The last seen quota, for the Reference tab. */
-export function quota() {
-  return quotaSeen;
-}
-
-function noteRateLimit(res) {
-  const retryAfter = Number(res.headers.get('retry-after') || 0);
-  const reset = Number(res.headers.get('x-ratelimit-reset') || 0) * 1000;
-  // Secondary limits send retry-after; the hourly quota sends a reset stamp. With
-  // neither visible (CORS can hide them), assume the ~10 minutes observed in practice.
-  rateLimitUntil = retryAfter ? Date.now() + retryAfter * 1000
-    : reset > Date.now() ? reset
-    : Date.now() + 10 * 60 * 1000;
-}
-
-function clearRateLimit() {
-  rateLimitUntil = 0;
-}
-
-/** Epoch ms until which GitHub is refusing this account's reads, or 0 if it isn't. */
-export function rateLimitedUntil() {
-  return rateLimitUntil > Date.now() ? rateLimitUntil : 0;
-}
-
-/** Accept a peeked copy into the cache. Only call this with no writes queued. */
-export function adopt(path, value, sha) {
-  cacheSet(path, value, sha);
+export function adoptDoc(name, value) {
+  cacheSet(docKey(name), value);
 }
 
 // ---------- writes ----------
+//
+// Everything below queues an operation and updates the local cache, so the UI is correct
+// on tap and correct after a reload, whether or not the network was there.
 
 /**
- * Writes go to the local cache first and the queue second, so the UI updates on tap.
- * The queue is flushed opportunistically and survives a reload, a closed tab, or a
- * ride spent out of signal.
+ * Queue one op. `key` is what makes a second write to the same thing replace the first
+ * rather than pile up behind it — six edits to one entry while offline should flush as
+ * one write, not six. Ordering between DIFFERENT keys is preserved, which is what makes
+ * "add an entry, then delete it" land correctly.
  */
-export function queueWrite(path, value, message) {
-  cacheSet(path, value, cachedSha(path));
-  const q = getQueue().filter((j) => j.path !== path); // one pending write per file, last wins
-  q.push({ path, message, at: Date.now() });
+function enqueue(key, op, label) {
+  const q = getQueue().filter((j) => j.key !== key);
+  q.push({ key, op, label, at: Date.now() });
   localStorage.setItem(LS.queue, JSON.stringify(q));
 }
 
@@ -441,28 +361,108 @@ export function pendingCount() {
   return getQueue().length;
 }
 
-async function putFile(path, value, message, sha) {
-  const token = getToken();
-  const body = {
-    message,
-    content: b64encode(JSON.stringify(value, null, 2) + '\n'),
-    ...(sha ? { sha } : {}),
-  };
-  return fetch(`${API}/repos/${OWNER}/${REPO}/contents/${path}`, {
-    method: 'PUT',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/vnd.github+json',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  });
+/**
+ * Persist a day by working out what actually changed about it.
+ *
+ * The app still thinks in whole days — every screen hands one around, and asking each of
+ * the seven call sites to say "I edited entry X" would spread the same bug across all of
+ * them. So the day arrives whole and the diff happens here, against the last copy the
+ * cache holds. What goes on the wire is entry-level either way.
+ *
+ * Diffing against the CACHE rather than what the app has in memory matters: a free-text
+ * entry is shown on screen before it is committed, so the in-memory copy already contains
+ * it and a diff against that would decide nothing had changed and never write it.
+ */
+export function saveDay(date, next) {
+  const m = monthOf(date);
+  const days = cacheGet(monthKey(m)) || {};
+  const prev = days[date] || { entries: [], confounders: [], notes: '' };
+
+  const before = new Map((prev.entries || []).map((e) => [e.id, e]));
+  const after = new Map((next.entries || []).map((e) => [e.id, e]));
+
+  for (const [id, entry] of after) {
+    if (JSON.stringify(before.get(id)) !== JSON.stringify(entry)) putEntry(date, entry);
+  }
+  for (const [id, entry] of before) {
+    if (!after.has(id)) deleteEntry(date, id, entry.label);
+  }
+
+  const dayLevel = (d) => JSON.stringify([!!d.closed, d.notes || '', d.confounders || []]);
+  if (dayLevel(prev) !== dayLevel(next)) {
+    putDay(date, { closed: !!next.closed, notes: next.notes || '', confounders: next.confounders || [] });
+  }
 }
 
-// Retry schedule for a failing write, by attempt count. The queue survives reloads and
-// closed tabs, so nothing is lost by waiting — whereas retrying hard costs the hourly
-// quota, and once that is gone every READ 403s as well and the app cannot even discover
-// that the work it is queuing has already been done by someone else.
+/** Put an entry. Same call for a new entry and an edit — the id decides which it is. */
+export function putEntry(date, entry) {
+  const days = cacheGet(monthKey(monthOf(date))) || {};
+  const day = days[date] || { entries: [], confounders: [], notes: '' };
+  const entries = [...(day.entries || []).filter((e) => e.id !== entry.id), entry]
+    .sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+  days[date] = { ...day, entries };
+  cacheSet(monthKey(monthOf(date)), days);
+  enqueue(`entry:${entry.id}`, { kind: 'entry', date, entry }, `log: ${date} ${entry.label}`);
+}
+
+/**
+ * Delete an entry.
+ *
+ * This is the operation the old model could not express. A month file union could not tell
+ * "deleted here" from "not seen here", so a delete on the phone was resurrected by the
+ * desktop's copy on the next write. There is no ambiguity in a DELETE.
+ */
+export function deleteEntry(date, id, label = '') {
+  const days = cacheGet(monthKey(monthOf(date))) || {};
+  const day = days[date];
+  if (day) {
+    days[date] = { ...day, entries: (day.entries || []).filter((e) => e.id !== id) };
+    cacheSet(monthKey(monthOf(date)), days);
+  }
+  enqueue(`entry:${id}`, { kind: 'entry.delete', id }, `delete: ${date} ${label}`.trim());
+}
+
+/** Day-level facts: closed, notes, confounders. */
+export function putDay(date, { closed = false, notes = '', confounders = [] } = {}) {
+  const days = cacheGet(monthKey(monthOf(date))) || {};
+  const day = { ...(days[date] || { entries: [] }), notes, confounders };
+  if (closed) day.closed = true; else delete day.closed;
+  days[date] = day;
+  cacheSet(monthKey(monthOf(date)), days);
+  enqueue(`day:${date}`, { kind: 'day', date, closed, notes, confounders }, `day: ${date}`);
+}
+
+export function putWeight(date, kg) {
+  const list = (cacheGet(docKey('weight')) || []).filter((w) => w.date !== date);
+  if (kg != null) list.push({ date, kg });
+  list.sort((a, b) => a.date.localeCompare(b.date));
+  cacheSet(docKey('weight'), list);
+  enqueue(`weight:${date}`, { kind: 'weight', date, kg }, `weight: ${date} ${kg}kg`);
+}
+
+/** Several weigh-ins at once, from a sync. One op each, so they dedupe per date. */
+export function putWeights(rows) {
+  for (const w of rows) putWeight(w.date, w.kg);
+}
+
+export function putWorkouts(rows) {
+  cacheSet(docKey('workouts'), rows);
+  enqueue('workouts', { kind: 'workouts', rows }, `sync: ${rows.length} workouts`);
+}
+
+export function putPlanned(rows) {
+  cacheSet(docKey('planned'), rows);
+  enqueue('planned', { kind: 'planned', rows }, `sync: ${rows.length} planned`);
+}
+
+export function putStatus(value) {
+  cacheSet(docKey('status'), value);
+  enqueue('config:status', { kind: 'config', key: 'status', value }, 'sync: status');
+}
+
+// Retry schedule for a failing flush, by attempt count. The queue survives reloads and
+// closed tabs, so nothing is lost by waiting — and retrying hard is precisely how the
+// previous backend got an entire account throttled.
 const BACKOFF_MS = [0, 0, 30e3, 2 * 60e3, 5 * 60e3, 15 * 60e3];
 
 function backoffRemaining(job) {
@@ -474,124 +474,9 @@ function backoffRemaining(job) {
 
 /** When the oldest stuck write will next be tried, or 0 if one is due now. */
 export function nextRetryAt() {
-  const waits = getQueue().map((j) => backoffRemaining(j)).filter((ms) => ms > 0);
-  return waits.length === getQueue().length && waits.length ? Date.now() + Math.min(...waits) : 0;
-}
-
-/**
- * Flush the queue. On a sha conflict the remote file is re-read and the local copy
- * re-applied on top, so a write from another device is never silently clobbered.
- */
-export async function flushQueue(onMerge) {
-  if (!getToken() || !navigator.onLine) {
-    return { flushed: 0, failed: pendingCount(), error: navigator.onLine ? null : 'offline' };
-  }
-  // GitHub is already refusing this account. Spending the attempt anyway extends the ban
-  // and teaches the backoff nothing.
-  if (rateLimitedUntil()) {
-    return { flushed: 0, failed: pendingCount(), error: 'GitHub is rate-limiting this account — the write is safe on this device and will retry' };
-  }
-  let flushed = 0;
-  let failed = 0;
-  // A write that fails forever used to be indistinguishable from one that had simply not
-  // been tried yet: both showed "waiting to sync". Keep the reason so the UI can tell him
-  // his food log is not reaching GitHub, rather than implying it is merely in a queue.
-  let error = null;
-
-  for (const job of getQueue()) {
-    const cached = cacheGet(job.path);
-    if (!cached) continue;
-    // A write that has failed repeatedly gets retried more slowly. Retrying every 60s,
-    // plus on every focus and every visibilitychange, from however many tabs are open,
-    // is how a single stuck write burned an entire hourly quota to zero — after which
-    // every read 403s too and nothing can recover. The queue is durable; it can wait.
-    if (backoffRemaining(job) > 0) { failed++; continue; }
-    try {
-      // What we actually sent. On a merge this stops being the local copy, and the cache
-      // has to end up holding the merged result — caching the pre-merge copy against the
-      // post-merge sha would look fine and then silently undo the merge on the next write.
-      let sent = cached.value;
-      let res = await putFile(job.path, sent, job.message, cached.sha);
-
-      if (res.status === 409 || res.status === 422) {
-        dbg(`write ${job.path}: sha conflict (${res.status}), re-reading and merging`);
-        const fresh = await fetch(`${API}/repos/${OWNER}/${REPO}/contents/${job.path}`, {
-          headers: { Authorization: `Bearer ${getToken()}`, Accept: 'application/vnd.github+json' },
-          cache: 'no-store',
-        });
-        if (fresh.ok) {
-          const meta = await fresh.json();
-          const remote = JSON.parse(b64decode(meta.content));
-          sent = onMerge ? onMerge(job.path, remote, cached.value) : cached.value;
-
-          // The merge changed nothing, so this write has nothing left to say. Almost
-          // always it is a phone holding pending copies of entries the parser has already
-          // resolved on GitHub: the queued write is fighting for the right to publish
-          // worse data, and losing, forever. Take the remote copy and drop the job.
-          if (JSON.stringify(sent) === JSON.stringify(remote)) {
-            cacheSet(job.path, remote, meta.sha);
-            dequeue(job.path);
-            flushed++;
-            dbg(`write ${job.path}: already on GitHub, nothing left to send — dropped`);
-            continue;
-          }
-
-          cacheSet(job.path, sent, meta.sha);
-          res = await putFile(job.path, sent, job.message + ' (merged)', meta.sha);
-        } else {
-          // Without this the caller sees the ORIGINAL 409 and is told the write conflicted,
-          // when in fact the app never managed to read the file it was conflicting with.
-          // Those need opposite responses and looked identical for three debugging sessions.
-          if (fresh.status === 403 && (fresh.headers.get('retry-after') || fresh.headers.get('x-ratelimit-remaining') === '0')) noteRateLimit(fresh);
-          throw new Error(`conflict, and the re-read failed too (GitHub ${fresh.status})`);
-        }
-      }
-
-      if (!res.ok) {
-        // GitHub says exactly what is wrong in the body and we were throwing it away, so
-        // every write failure arrived as a bare status code and three separate debugging
-        // sessions had to guess. Never again.
-        let detail = '';
-        try { detail = (await res.json())?.message || ''; } catch { /* body may be empty */ }
-        let why = `GitHub ${res.status}${detail ? ` — ${detail}` : ''}`;
-        if (res.status === 403) {
-          // A rate-limited 403 and a dead-token 403 need opposite advice: one says wait,
-          // the other says go re-issue the token. Don't send him to GitHub settings for
-          // a limiter that clears itself in ten minutes.
-          if (res.headers.get('retry-after') || res.headers.get('x-ratelimit-remaining') === '0') {
-            noteRateLimit(res);
-            why = 'GitHub is rate-limiting this account — the write is safe on this device and will retry';
-          } else {
-            why = 'GitHub refused the write (403) — the token is probably read-only or expired';
-          }
-        }
-        if (res.status === 404) why = 'GitHub returned 404 — the token has lost access to fuel-data';
-        if (res.status === 401) why = 'Token rejected (401) — it has expired or been revoked';
-        throw new Error(why);
-      }
-      const out = await res.json();
-      cacheSet(job.path, sent, out.content.sha);
-      dequeue(job.path);
-      flushed++;
-      dbg(`write ${job.path}: flushed ok (queued ${Math.round((Date.now() - job.at) / 1000)}s ago)`);
-    } catch (e) {
-      failed++;
-      error = error || e.message;
-      markAttempt(job.path, e.message);
-      dbg(`write ${job.path}: FAILED — ${e.message}`);
-    }
-  }
-
-  if (flushed) localStorage.setItem(LS.lastSync, String(Date.now()));
-  return { flushed, failed, error };
-}
-
-/** Record that a queued write was tried and failed, so the UI can stop calling it "waiting". */
-function markAttempt(path, message) {
-  const q = getQueue().map((j) =>
-    j.path === path ? { ...j, attempts: (j.attempts || 0) + 1, lastError: message, lastTry: Date.now() } : j
-  );
-  localStorage.setItem(LS.queue, JSON.stringify(q));
+  const q = getQueue();
+  const waits = q.map((j) => backoffRemaining(j)).filter((ms) => ms > 0);
+  return waits.length === q.length && waits.length ? Date.now() + Math.min(...waits) : 0;
 }
 
 /** The oldest stuck write, if any write has now failed more than once. */
@@ -600,77 +485,119 @@ export function stuckWrite() {
 }
 
 /**
- * Abandon a queued write. Only for the case where the remote copy already contains
- * everything the queued one was trying to say — see the merge check in `flushQueue`.
- */
-export function discardWrite(path) {
-  dequeue(path);
-  dbg(`write ${path}: discarded, GitHub already has this content`);
-}
-
-function dequeue(path) {
-  localStorage.setItem(LS.queue, JSON.stringify(getQueue().filter((j) => j.path !== path)));
-}
-
-// ---------- paths ----------
-
-export const paths = {
-  athlete: 'athlete.json',
-  weight: 'weight.json',
-  templates: 'templates.json',
-  workouts: 'sync/workouts.json',
-  planned: 'sync/planned.json',
-  status: 'sync/status.json',
-  // One file per MONTH, not per day. Per-day files meant ~27 concurrent API calls on every
-  // open, which trips GitHub's secondary (burst) rate limit and returns 403. A month per
-  // file makes a full load 8 requests regardless of how long the log runs.
-  month: (iso) => `log/${iso.slice(0, 7)}.json`,
-};
-
-/** An entry still waiting on the parser: free text, no macros yet, not given up on. */
-function awaitingParse(e) {
-  return e?.source === 'freetext' && e.parse_state !== 'failed';
-}
-
-/**
- * Pick between two copies of the same entry. Local wins by default — it is the newer
- * edit in every ordinary case — EXCEPT where the local copy is still awaiting the parser
- * and the remote one has been resolved.
+ * Flush the queue: one request carrying every pending op, in order.
  *
- * That exception is the whole point. The parser rewrites entries in place on GitHub, so a
- * phone holding the pre-parse copy is stale even though its copy is the "local" one.
- * Straight local-wins pushes zero macros back over resolved ones, silently understating
- * the day and making the parser re-bill for food it has already estimated.
+ * One request rather than one per file is what makes the whole day's worth of edits a
+ * single round trip. It is also why there is no partial-success case to reason about —
+ * the server applies the batch in a transaction, so this either all landed or none of it
+ * did, and a retry of the whole batch is safe because every op is idempotent.
  */
-function preferEntry(remote, local) {
-  if (!remote) return local;
-  if (!local) return remote;
-  if (awaitingParse(local) && !awaitingParse(remote)) return remote;
-  return local;
-}
-
-/**
- * Merge rule for month files: union days, and within a shared day union entries by id.
- * Lets the phone and the desktop both write the same month without either losing work.
- *
- * Known gap: a deletion on one device is resurrected by the other device's copy, because
- * a union cannot tell "deleted here" from "not yet seen here". Fixing that needs
- * tombstones, which is a bigger change than this merge.
- */
-export function mergeMonth(path, remote, local) {
-  if (!path.startsWith('log/')) return local;
-  const days = { ...(remote?.days || {}) };
-  for (const [date, localDay] of Object.entries(local?.days || {})) {
-    const remoteDay = days[date];
-    if (!remoteDay) { days[date] = localDay; continue; }
-    const byId = new Map();
-    for (const e of remoteDay.entries || []) byId.set(e.id, e);
-    for (const e of localDay.entries || []) byId.set(e.id, preferEntry(byId.get(e.id), e));
-    days[date] = {
-      ...remoteDay,
-      ...localDay,
-      entries: [...byId.values()].sort((a, b) => (a.time || '').localeCompare(b.time || '')),
-    };
+export async function flushQueue() {
+  const queue = getQueue();
+  if (!queue.length) return { flushed: 0, failed: 0, error: null };
+  if (!getKey()) return { flushed: 0, failed: queue.length, error: 'no key on this device' };
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return { flushed: 0, failed: queue.length, error: 'offline' };
   }
-  return { ...remote, ...local, days };
+  const wait = Math.min(...queue.map((j) => backoffRemaining(j)));
+  if (wait > 0) return { flushed: 0, failed: queue.length, error: queue[0].lastError || null };
+
+  // Which jobs this attempt speaks for. A tap during the round trip appends a new job,
+  // and clearing the queue wholesale on success would throw it away unsent.
+  const sending = queue.map((j) => `${j.key}@${j.at}`);
+
+  try {
+    await call('/data/ops', { method: 'POST', body: { ops: queue.map((j) => j.op) } });
+    const remaining = getQueue().filter((j) => !sending.includes(`${j.key}@${j.at}`));
+    localStorage.setItem(LS.queue, JSON.stringify(remaining));
+    markSynced();
+    dbg(`flush: ${queue.length} op(s) landed${remaining.length ? `, ${remaining.length} queued during the send` : ''}`);
+    return { flushed: queue.length, failed: remaining.length, error: null };
+  } catch (e) {
+    const why = e.status === 401
+      ? 'Key rejected — it has been rotated. Paste the new one.'
+      : e.message;
+    markAttempt(sending, why);
+    dbg(`flush: FAILED — ${why}`);
+    return { flushed: 0, failed: queue.length, error: why };
+  }
+}
+
+/** Record that a batch was tried and failed, so the UI can stop calling it "waiting". */
+function markAttempt(sending, message) {
+  const q = getQueue().map((j) => (sending.includes(`${j.key}@${j.at}`)
+    ? { ...j, attempts: (j.attempts || 0) + 1, lastError: message, lastTry: Date.now() }
+    : j));
+  localStorage.setItem(LS.queue, JSON.stringify(q));
+}
+
+// ---------- synchronous parsing ----------
+//
+// The Worker estimates macros in the HTTP response, so an entry is written once, already
+// resolved. That deletes the "client must discover an out-of-band mutation" problem: the
+// GitHub Action rewriting entries in place, and the client polling to notice, failed four
+// separate ways in one day.
+//
+// The fallback is no longer a GitHub Action. It is the queue: the entry is written as free
+// text awaiting a parse, and re-estimated on the next attempt. Nothing is out of band.
+
+// Observed round trips: 5.2s, 7.3s, 8.0s, and one that ran past 10s and fell back. The
+// original 10s was set from an assumed 1-2s and left almost no headroom, so an estimate
+// that was on its way got thrown away.
+const PARSE_TIMEOUT_MS = 20000;
+
+/**
+ * Estimate macros for free-text entries, synchronously.
+ *
+ * Returns an array of results, or **null** meaning "this did not work, keep it pending".
+ * Never throws: the caller's fallback is the whole safety net, so an exception here would
+ * be an outage rather than a degradation.
+ */
+export async function parseText(entries, timeoutMs = PARSE_TIMEOUT_MS) {
+  if (!getKey() || !entries?.length) {
+    dbg(`parse: skipped (${!getKey() ? 'no key' : 'nothing to parse'})`);
+    return null;
+  }
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    dbg('parse: offline, leaving the entry pending');
+    return null;
+  }
+
+  const started = Date.now();
+  try {
+    const out = (await call('/parse', { method: 'POST', body: { entries }, timeoutMs }))?.entries;
+    if (!Array.isArray(out) || !out.length) {
+      dbg('parse: response had no estimates, leaving the entry pending');
+      return null;
+    }
+    dbg(`parse: resolved ${out.length} in ${Date.now() - started}ms`);
+    return out;
+  } catch (e) {
+    dbg(`parse: ${e.message} after ${Date.now() - started}ms, leaving the entry pending`);
+    return null;
+  }
+}
+
+/**
+ * Pull training data from TrainingPeaks, now, through the Worker.
+ *
+ * `sync.py` runs hourly on the Mac and cannot be reached from a page on GitHub Pages, so
+ * "sync now" used to be impossible. TrainingPeaks the Worker can reach directly.
+ *
+ * Returns `{ workouts, planned, weights, lifts }` or `{ error }` — this one reports its
+ * failure rather than degrading silently, because he pressed a button and is waiting.
+ */
+export async function syncTraining(timeoutMs = 30000) {
+  try {
+    const body = await call('/sync', { method: 'POST', timeoutMs });
+    if (!Array.isArray(body.workouts) || !Array.isArray(body.planned)) {
+      dbg('sync: response was the wrong shape');
+      return { error: 'TrainingPeaks returned nothing usable' };
+    }
+    dbg(`sync: ${body.workouts.length} workouts, ${body.planned.length} planned`);
+    return body;
+  } catch (e) {
+    dbg(`sync: ${e.message}`);
+    return { error: `Could not reach the sync service — ${e.message}.` };
+  }
 }
