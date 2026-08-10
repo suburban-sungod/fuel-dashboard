@@ -203,7 +203,6 @@ function wire() {
 
   $$('.tab').forEach((b) => b.onclick = () => { state.view = b.dataset.view; render(); });
   $('#toggle-table').onclick = () => { const t = $('#day-table'); t.hidden = !t.hidden; };
-  $('#weight-save').onclick = logWeight;
 
   $$('[data-close]').forEach((n) => n.onclick = closeSheet);
   $$('.seg-btn').forEach((b) => b.onclick = () => selectTab(b.dataset.tab));
@@ -211,7 +210,6 @@ function wire() {
   $('#add-entry').onclick = () => openSheet();
   $('#add-entry-bottom').onclick = () => openSheet();
   $('#sync-now').onclick = syncNow;
-  $('#weight-save-today').onclick = logWeight;
 }
 
 // ============ render ============
@@ -311,21 +309,25 @@ async function syncNow() {
   S.putWorkouts(res.workouts);
   S.putPlanned(res.planned);
 
-  // Weigh-ins from the Garmin scales, by way of TrainingPeaks. Union by date, and
-  // anything already in the log wins: he only ever types a weight to correct one, and a
-  // sync that reverted the correction would be worse than not syncing weight at all.
+  // Weigh-ins from the Garmin scales, by way of TrainingPeaks. Union by date, and the
+  // SCALES win on any date they cover.
+  //
+  // This used to be the other way round — whatever was already logged won — because he
+  // could type a weight by hand and an hourly sync reverting the correction would be
+  // worse than not syncing at all. There is no typing any more, so the stored copy is
+  // just an older copy of the same reading, and letting it win meant a value the scales
+  // later corrected could never land.
   let newWeighIns = 0;
   if (res.weights?.length) {
-    const byDate = new Map(res.weights.map((w) => [w.date, w]));
-    const before = byDate.size;
-    for (const w of state.weights || []) byDate.set(w.date, w);
-    newWeighIns = before - (state.weights || []).filter((w) => res.weights.some((s) => s.date === w.date)).length;
+    const byDate = new Map((state.weights || []).map((w) => [w.date, w]));
+    const had = new Map((state.weights || []).map((w) => [w.date, w.kg]));
+    newWeighIns = res.weights.filter((w) => !had.has(w.date)).length;
+    for (const w of res.weights) byDate.set(w.date, w);
     const merged = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
     if (JSON.stringify(merged) !== JSON.stringify(state.weights)) {
       // Only the dates that actually moved. One op per date rather than one op for the
-      // whole list means a weigh-in typed on the desktop is not overwritten by a phone
-      // flushing a list it built before that weigh-in existed.
-      const had = new Map((state.weights || []).map((w) => [w.date, w.kg]));
+      // whole list keeps two devices syncing at once from overwriting each other with
+      // lists each built before the other's reading existed.
       S.putWeights(merged.filter((w) => had.get(w.date) !== w.kg));
       state.weights = merged;
     }
@@ -491,7 +493,45 @@ function renderToday() {
   }
 
   renderFlags(t, tot);
+  renderTodayWeight();
 }
+
+/**
+ * The day's weigh-in, if the scales sent one.
+ *
+ * Read-only, and there is no input anywhere any more. Typing a weight was only ever
+ * duplicating what the Garmin scales already push through TrainingPeaks, and two writers
+ * for one number meant a merge rule ("anything typed by hand wins") existing purely to
+ * stop the hourly sync reverting a correction. One source, no rule.
+ *
+ * Shown against the previous weigh-in rather than alone: he weighs a couple of times a
+ * week, so the number on its own says nothing a glance at the trend would not, and the
+ * delta is the part he is actually looking for as he steps off.
+ */
+function renderTodayWeight() {
+  const box = $('#today-weight');
+  const sorted = [...state.weights].sort((a, b) => a.date.localeCompare(b.date));
+  const i = sorted.findIndex((w) => w.date === state.date);
+  // Nothing to say on a day he did not weigh, and an empty row saying so is worse than
+  // no row: it reads as a prompt to do something, and there is nothing to do.
+  if (i === -1) { box.hidden = true; return; }
+
+  const kg = sorted[i].kg;
+  const prev = sorted[i - 1];
+  const parts = [`<b>${kg.toFixed(1)} kg</b>`];
+  if (prev) {
+    const d = kg - prev.kg;
+    // A tenth is scale noise, not a change. Calling 0.1 a gain invites reading meaning
+    // into a number that means nothing.
+    const move = Math.abs(d) < 0.15
+      ? 'level'
+      : `${d > 0 ? '+' : '−'}${Math.abs(d).toFixed(1)} kg`;
+    parts.push(`<span class="muted">${move} since ${shortDate(prev.date)}</span>`);
+  }
+  box.innerHTML = parts.join(' ');
+  box.hidden = false;
+}
+
 
 function barRow(label, value, max, right, color, opts = {}) {
   const row = el('div', 'bar-row');
@@ -1605,20 +1645,6 @@ async function resume() {
   } finally {
     resuming = false;
   }
-}
-
-/** Reads whichever weigh-in box has a value — Today and Trends both have one. */
-function logWeight() {
-  const boxes = ['#weight-input-today', '#weight-input'].map((s) => $(s)).filter(Boolean);
-  const box = boxes.find((b) => b.value !== '');
-  const kg = Number(box?.value);
-  if (!kg || kg < 40 || kg > 200) return;
-  state.weights = [...state.weights.filter((w) => w.date !== state.date), { date: state.date, kg }]
-    .sort((a, b) => a.date.localeCompare(b.date));
-  S.putWeight(state.date, kg);
-  boxes.forEach((b) => (b.value = ''));
-  render();
-  flush();
 }
 
 if ('serviceWorker' in navigator) {
