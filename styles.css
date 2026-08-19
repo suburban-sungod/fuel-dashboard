@@ -356,3 +356,18 @@ th { color: var(--txt2); font-weight: 600; font-size: 11px; text-transform: uppe
   .tile-grid { grid-template-columns: repeat(4, 1fr); }
   .sheet-body { max-width: 560px; margin: 0 auto; border-radius: 20px; bottom: 24px; left: 16px; right: 16px; }
 }
+
+/* Chart hover readout. SVG <title> already carried the numbers, but a native tooltip
+   needs a second of stillness on a 3.5px dot, which in practice meant it never appeared. */
+.chart-wrap { position: relative; }
+.chart-tip {
+  position: absolute; pointer-events: none; z-index: 5;
+  transform: translate(-50%, -100%);
+  background: var(--surface); color: var(--txt1);
+  border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 5px 9px; font-size: 12px; line-height: 1.35; white-space: nowrap;
+}
+.chart-tip[hidden] { display: none; }
+.chart-tip b { font-variant-numeric: tabular-nums; }
+.chart-tip .tip-date { color: var(--txt3); font-size: 11px; display: block; }

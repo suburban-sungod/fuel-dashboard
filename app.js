@@ -18,7 +18,7 @@ const state = {
   // assembles days from rows — but the app still pages a month at a time, so this is what
   // stops it re-asking for one it already has.
   loadedMonths: new Set(),
-  date: F.isoDate(new Date()), view: 'today', pendingTab: 'meals', category: null,
+  date: F.isoDate(new Date()), view: 'today', category: null,
 };
 
 // The real calendar date as of the last check, so a midnight rollover can be detected.
@@ -1015,7 +1015,42 @@ function renderWeight() {
   svg.appendChild(node('text', { x: PAD.l, y: h - BOT + 26, fill: 'var(--txt3)', 'font-size': 9 }, shortDate(pts[0].date)));
   svg.appendChild(node('text', { x: w - PAD.r, y: h - BOT + 26, 'text-anchor': 'end', fill: 'var(--txt3)', 'font-size': 9 }, shortDate(pts[pts.length - 1].date)));
 
-  box.appendChild(svg);
+  // The SVG needs a positioned parent for the hover readout to sit against.
+  const wrap = el('div', 'chart-wrap');
+  wrap.appendChild(svg);
+  const tip = el('div', 'chart-tip');
+  tip.hidden = true;
+  wrap.appendChild(tip);
+  box.appendChild(wrap);
+
+  // Hover readout. Each weigh-in gets a generous invisible target: the visible dot is
+  // 3.5px, which is far too small to hover deliberately, and the SVG <title> it used to
+  // rely on needs a second of stillness before the OS draws anything.
+  for (const r of pts) {
+    const hit = node('circle', { cx: X(r.date), cy: Y(r.kg), r: 13, fill: 'transparent', style: 'cursor:pointer' });
+    const show = () => {
+      tip.innerHTML = `<span class="tip-date">${longDate(r.date)}</span><b>${r.kg.toFixed(1)} kg</b>`;
+      tip.hidden = false;
+      // Positioned in the SVG's own coordinate space, scaled to however wide it rendered.
+      const scale = svg.getBoundingClientRect().width / w || 1;
+      const px = X(r.date) * scale, py = Y(r.kg) * scale;
+      // Clamped inside the card. The rightmost point is today's weigh-in, the one most
+      // worth hovering, and unclamped it hung off the edge and got clipped.
+      const tw = tip.offsetWidth, th = tip.offsetHeight;
+      const left = Math.min(Math.max(px, tw / 2 + 2), Math.max(tw / 2 + 2, wrap.clientWidth - tw / 2 - 2));
+      const below = py - th - 10 < 0; // no room above: flip under the point
+      tip.style.left = `${left}px`;
+      tip.style.top = `${below ? py + 16 : py - 10}px`;
+      tip.style.transform = below ? 'translate(-50%, 0)' : 'translate(-50%, -100%)';
+    };
+    hit.addEventListener('pointerenter', show);
+    hit.addEventListener('pointerdown', show);
+    hit.addEventListener('pointerleave', () => { tip.hidden = true; });
+    svg.appendChild(hit);
+  }
+  // Leaving the plot entirely, including straight off the edge from a point.
+  svg.addEventListener('pointerleave', () => { tip.hidden = true; });
+
   // Only say "60 days" when something was actually clipped. Otherwise the axis dates
   // already say the range and a second, larger number next to them just reads as a bug.
   const clipped = raw.length > pts.length;
@@ -1032,6 +1067,8 @@ function renderWeight() {
   } else { note.hidden = true; }
 }
 function shortDate(iso) { return localDate(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }); }
+/** Weekday included: it is what makes a Monday spike after a weekend legible at a glance. */
+function longDate(iso) { return localDate(iso).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' }); }
 
 function renderCalChart() {
   const box = $('#cal-chart');
@@ -1230,10 +1267,10 @@ function openSheet(entry = null, category = null) {
 
   $('#sheet-title').textContent = entry ? 'Edit' : 'Log';
   $('#c-save').textContent = entry ? 'Save changes' : 'Add';
-  // Editing always uses the custom pane — the tile grids only make sense for adding. Show
-  // it without recording it as his choice, or one edit silently changes which tab the Log
-  // button opens on from then on.
-  showTab(entry ? 'custom' : state.pendingTab);
+  // Always opens on Custom, adding or editing. Typing the food is the fast path and the
+  // one that reaches the estimator; the tile grids are a shortcut for repeats and are one
+  // tap away. The sheet deliberately does not remember the last tab used.
+  showTab('custom');
   $$('.seg').forEach((s) => (s.hidden = !!entry));
 
   $('#sheet').hidden = false;
@@ -1260,9 +1297,7 @@ function showTab(tab) {
   ['meals', 'singles', 'custom'].forEach((t) => { $('#sheet-' + t).hidden = t !== tab; });
 }
 
-/** He picked this one, so remember it for next time. */
 function selectTab(tab) {
-  state.pendingTab = tab;
   showTab(tab);
   focusCustom();
 }
