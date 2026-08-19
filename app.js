@@ -1076,7 +1076,11 @@ function renderCalChart() {
   const dates = recentDates(14).reverse();
   const rows = dates.map((d) => {
     const t = F.targetsFor(d, ctx());
-    return { date: d, intake: F.dayTotals(state.logs[d]?.entries || []).kcal, target: t.kcal_target, logged: (state.logs[d]?.entries || []).length > 0 };
+    return {
+      date: d, intake: F.dayTotals(state.logs[d]?.entries || []).kcal,
+      target: t.kcal_target, tdee: t.tdee, deficit: t.planned_deficit,
+      logged: (state.logs[d]?.entries || []).length > 0,
+    };
   });
   if (!rows.some((r) => r.logged)) { box.appendChild(el('p', 'muted small', 'No days logged in the last fortnight.')); return; }
 
@@ -1088,7 +1092,7 @@ function renderCalChart() {
   // thirteen days into the bottom third — losing the only thing the chart is for, which
   // is how each day sat against its own target. Anything above the top is drawn clipped
   // with a caret, so the outlier is still visible and obviously off-scale.
-  const spread = rows.flatMap((r) => [r.logged ? r.intake : 0, r.target || 0]).filter((v) => v > 0);
+  const spread = rows.flatMap((r) => [r.logged ? r.intake : 0, r.target || 0, r.tdee || 0]).filter((v) => v > 0);
   const yMax = Math.max(3200, F.percentile(spread, 0.9)) * 1.1;
   gridlines(svg, w, h, 0, yMax, (v) => (v / 1000).toFixed(1) + 'k');
 
@@ -1105,13 +1109,30 @@ function renderCalChart() {
         fill: 'none', stroke: 'var(--txt3)', 'stroke-width': 1.5, 'stroke-linecap': 'round',
       }));
     };
+    // The planned-deficit band: target at the bottom, maintenance at the top. A bar
+    // finishing anywhere in here is over plan and STILL losing weight, which the old
+    // two-colour version reported as a flat failure.
+    if (r.target && r.tdee && r.tdee > r.target) {
+      const band = node('rect', {
+        x: x + 2, y: h - PAD.b - H(r.tdee), width: Math.max(3, bw - 4),
+        height: Math.max(1, H(r.tdee) - H(r.target)), rx: 3, fill: 'var(--warn)', opacity: .13,
+      });
+      band.appendChild(node('title', {}, `${r.date}: ${num(r.target)}–${num(r.tdee)} kcal — over the ${num(r.deficit)} plan but still under maintenance`));
+      svg.appendChild(band);
+    }
     if (r.logged) {
-      const over = r.target && r.intake > r.target;
+      // Three states, because "over target" and "gaining weight" are not the same thing.
+      const fill = !r.target ? 'var(--s3)'
+        : r.intake <= r.target ? 'var(--s3)'
+        : r.tdee && r.intake <= r.tdee ? 'var(--warn)'
+        : 'var(--bad)';
       const bar = node('rect', {
         x: x + 2, y: h - PAD.b - H(r.intake), width: Math.max(3, bw - 4), height: Math.max(1, H(r.intake)),
-        rx: 4, fill: over ? 'var(--s2)' : 'var(--s3)',
+        rx: 4, fill,
       });
-      bar.appendChild(node('title', {}, `${r.date}: ${num(r.intake)} kcal vs target ${num(r.target)}`));
+      const gap = r.tdee == null ? null : r.tdee - r.intake;
+      bar.appendChild(node('title', {}, `${r.date}: ${num(r.intake)} kcal · target ${num(r.target)} · maintenance ${num(r.tdee)}`
+        + (gap == null ? '' : gap >= 0 ? `\n${num(gap)} under maintenance` : `\n${num(-gap)} over maintenance`)));
       svg.appendChild(bar);
       caret(x + bw / 2, r.intake > yMax);
     }
@@ -1125,14 +1146,27 @@ function renderCalChart() {
       svg.appendChild(line);
       caret(x + bw / 2, r.target > yMax);
     }
+    // Maintenance: the line that actually separates losing from gaining.
+    if (r.tdee) {
+      const line = node('line', {
+        x1: x + 1, x2: x + bw - 1, y1: h - PAD.b - H(r.tdee), y2: h - PAD.b - H(r.tdee),
+        stroke: 'var(--txt3)', 'stroke-width': 1.5, 'stroke-dasharray': '4 3', 'stroke-linecap': 'round',
+      });
+      line.appendChild(node('title', {}, `${r.date}: maintenance ${num(r.tdee)} kcal`));
+      svg.appendChild(line);
+      caret(x + bw / 2, r.tdee > yMax);
+    }
     if (i % 2 === 0) svg.appendChild(node('text', { x: x + bw / 2, y: h - 5, 'text-anchor': 'middle', fill: 'var(--txt3)', 'font-size': 9 }, localDate(r.date).getDate()));
   });
 
   box.appendChild(svg);
+  const plan = rows.find((r) => r.deficit)?.deficit;
   $('#cal-legend').innerHTML = `
-    <span><i style="background:var(--s3)"></i>At or under target</span>
-    <span><i style="background:var(--s2)"></i>Over target</span>
-    <span><i style="background:var(--txt2);height:2px;border-radius:1px"></i>Target</span>
+    <span><i style="background:var(--s3)"></i>On plan or better</span>
+    <span><i style="background:var(--warn)"></i>Over plan, still losing</span>
+    <span><i style="background:var(--bad)"></i>Over maintenance</span>
+    <span><i style="background:var(--txt2);height:2px;border-radius:1px"></i>Target${plan ? ` (maintenance − ${num(plan)})` : ''}</span>
+    <span><i style="background:var(--txt3);height:2px;border-radius:1px"></i>Maintenance</span>
     ${clipped ? '<span><i style="background:transparent">↑</i>Above the scale — big day, hover for the number</span>' : ''}`;
 }
 
