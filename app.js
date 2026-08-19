@@ -207,6 +207,15 @@ function wire() {
   $$('[data-close]').forEach((n) => n.onclick = closeSheet);
   $$('.seg-btn').forEach((b) => b.onclick = () => selectTab(b.dataset.tab));
   $('#c-save').onclick = addCustom;
+  // Enter submits from anywhere in the custom pane. Every field here is a single line, so
+  // Enter has no other job, and the whole point of this sheet is logging something fast.
+  for (const sel of ['#c-label', '#c-kcal', '#c-protein', '#c-carbs', '#c-fat', '#entry-time']) {
+    $(sel).addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' || e.isComposing) return;
+      e.preventDefault();
+      addCustom();
+    });
+  }
   $('#add-entry').onclick = () => openSheet();
   $('#add-entry-bottom').onclick = () => openSheet();
   $('#sync-now').onclick = syncNow;
@@ -891,15 +900,64 @@ function gridlines(svg, w, h, yMin, yMax, fmt, steps = 4) {
   }
 }
 
+// The chart shows a window, not the whole history. A year of weigh-ins with a four-month
+// gap in the middle squashes the part he actually cares about into a few pixels.
+const WEIGHT_WINDOW_DAYS = 60;
+
+/**
+ * Monotone cubic (Fritsch-Carlson) through the points, as an SVG path.
+ *
+ * Deliberately NOT a plain Catmull-Rom: that overshoots between points, which on a weight
+ * chart draws a dip below a low the scale never showed. Monotone cannot invent a turning
+ * point, so every trough and peak on the curve is one that is really in the data.
+ */
+function monotonePath(pts) {
+  const n = pts.length;
+  if (n < 2) return '';
+  const P = (p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`;
+  if (n === 2) return `M${P(pts[0])} L${P(pts[1])}`;
+
+  const dx = [], m = [];
+  for (let i = 0; i < n - 1; i++) {
+    dx[i] = pts[i + 1].x - pts[i].x;
+    m[i] = dx[i] === 0 ? 0 : (pts[i + 1].y - pts[i].y) / dx[i];
+  }
+  const t = [m[0]];
+  for (let i = 1; i < n - 1; i++) {
+    if (m[i - 1] * m[i] <= 0) { t[i] = 0; continue; }
+    const w1 = 2 * dx[i] + dx[i - 1], w2 = dx[i] + 2 * dx[i - 1];
+    t[i] = (w1 + w2) / (w1 / m[i - 1] + w2 / m[i]);
+  }
+  t[n - 1] = m[n - 2];
+
+  let d = `M${P(pts[0])}`;
+  for (let i = 0; i < n - 1; i++) {
+    const h = dx[i] / 3;
+    d += ` C${(pts[i].x + h).toFixed(1)},${(pts[i].y + t[i] * h).toFixed(1)}`
+      + ` ${(pts[i + 1].x - h).toFixed(1)},${(pts[i + 1].y - t[i + 1] * h).toFixed(1)}`
+      + ` ${P(pts[i + 1])}`;
+  }
+  return d;
+}
+
 function renderWeight() {
   const box = $('#weight-chart');
   box.innerHTML = '';
   const raw = [...state.weights].sort((a, b) => a.date.localeCompare(b.date));
   if (raw.length < 2) { box.appendChild(el('p', 'muted small', 'Need at least two weigh-ins to draw a trend.')); return; }
 
+  // Rolling and rate stay computed over the WHOLE history. Windowing the input instead of
+  // the output would leave the left edge of the chart with a half-filled 7-day window and
+  // a trend rate that changes meaning every time the window slides.
   const roll = F.rollingWeight(state.weights);
   const rate = F.weightTrendRate(roll);
   $('#weight-rate').textContent = rate == null ? 'trend needs denser weighing' : `${rate >= 0 ? '+' : '−'}${Math.abs(rate).toFixed(2)} kg/wk`;
+
+  const cutoff = F.addDays(raw[raw.length - 1].date, -(WEIGHT_WINDOW_DAYS - 1));
+  let pts = raw.filter((r) => r.date >= cutoff);
+  let line = roll.filter((r) => r.date >= cutoff);
+  // Too sparse a window is worse than a long one — fall back rather than draw two dots.
+  if (pts.length < 2) { pts = raw; line = roll; }
 
   const w = 640, h = 250;
   const BOT = 40; // room for the date row and the confounder rug beneath it
@@ -908,13 +966,13 @@ function renderWeight() {
 
   // Scale to the weight data only. Pinning the goal into the domain squashes months of
   // real movement into the top centimetre of the chart when the goal is still 5kg away.
-  const all = raw.map((r) => r.kg).concat(roll.map((r) => r.kg));
+  const all = pts.map((r) => r.kg).concat(line.map((r) => r.kg));
   let yMin = Math.floor((Math.min(...all) - 0.6) * 2) / 2;
   let yMax = Math.ceil((Math.max(...all) + 0.6) * 2) / 2;
   const goalInView = goal >= yMin && goal <= yMax;
   if (goalInView) { yMin = Math.min(yMin, goal - 0.4); }
 
-  const t0 = F.parseISO(raw[0].date).getTime(), t1 = F.parseISO(raw[raw.length - 1].date).getTime();
+  const t0 = F.parseISO(pts[0].date).getTime(), t1 = F.parseISO(pts[pts.length - 1].date).getTime();
   const X = (d) => PAD.l + ((F.parseISO(d).getTime() - t0) / Math.max(1, t1 - t0)) * (w - PAD.l - PAD.r);
   const Y = (kg) => h - BOT - ((kg - yMin) / (yMax - yMin)) * (h - PAD.t - BOT);
 
@@ -934,14 +992,14 @@ function renderWeight() {
   }
 
   // rolling average — the primary read
-  if (roll.length >= 2) {
-    const d = roll.map((r, i) => `${i ? 'L' : 'M'}${X(r.date).toFixed(1)},${Y(r.kg).toFixed(1)}`).join(' ');
-    svg.appendChild(node('path', { d, fill: 'none', stroke: 'var(--s1)', 'stroke-width': 2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }));
+  if (line.length >= 2) {
+    const d = monotonePath(line.map((r) => ({ x: X(r.date), y: Y(r.kg) })));
+    svg.appendChild(node('path', { d, fill: 'none', stroke: 'var(--s1)', 'stroke-width': 2.5, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }));
   }
 
   // raw points, secondary
-  for (const r of raw) {
-    const c = node('circle', { cx: X(r.date), cy: Y(r.kg), r: 4, fill: 'var(--surface)', stroke: 'var(--s1)', 'stroke-width': 2 });
+  for (const r of pts) {
+    const c = node('circle', { cx: X(r.date), cy: Y(r.kg), r: 3.5, fill: 'var(--surface)', stroke: 'var(--s1)', 'stroke-width': 1.5, opacity: .75 });
     c.appendChild(node('title', {}, `${r.date}: ${r.kg}kg`));
     svg.appendChild(c);
     // confounder marker
@@ -954,22 +1012,25 @@ function renderWeight() {
   }
 
   // date ends, sitting above the confounder rug
-  svg.appendChild(node('text', { x: PAD.l, y: h - BOT + 26, fill: 'var(--txt3)', 'font-size': 9 }, shortDate(raw[0].date)));
-  svg.appendChild(node('text', { x: w - PAD.r, y: h - BOT + 26, 'text-anchor': 'end', fill: 'var(--txt3)', 'font-size': 9 }, shortDate(raw[raw.length - 1].date)));
+  svg.appendChild(node('text', { x: PAD.l, y: h - BOT + 26, fill: 'var(--txt3)', 'font-size': 9 }, shortDate(pts[0].date)));
+  svg.appendChild(node('text', { x: w - PAD.r, y: h - BOT + 26, 'text-anchor': 'end', fill: 'var(--txt3)', 'font-size': 9 }, shortDate(pts[pts.length - 1].date)));
 
   box.appendChild(svg);
+  // Only say "60 days" when something was actually clipped. Otherwise the axis dates
+  // already say the range and a second, larger number next to them just reads as a bug.
+  const clipped = raw.length > pts.length;
   box.appendChild(el('div', 'legend', `
     <span><i style="background:var(--s1);height:2px;border-radius:1px"></i>7-day average</span>
     <span><i style="background:transparent;border:2px solid var(--s1);border-radius:50%"></i>Weigh-in</span>
-    <span><i style="background:var(--s2)"></i>Confounder flagged</span>`));
+    <span><i style="background:var(--s2)"></i>Confounder flagged</span>
+    ${clipped ? `<span class="muted">last ${WEIGHT_WINDOW_DAYS} days</span>` : ''}`));
 
   const note = $('#weight-note');
-  if (roll.length < 2) {
+  if (line.length < 2) {
     note.hidden = false;
-    note.innerHTML = `<b>No rolling average line yet.</b> A 7-day average needs at least ${F.ROLLING_MIN_POINTS} weigh-ins inside a 7-day window. You have ${raw.length} readings spread over ${F.daysBetween(raw[0].date, raw[raw.length - 1].date)} days, so only the raw points are drawn. Weigh most mornings for a fortnight and the trend line appears.`;
+    note.innerHTML = `<b>No rolling average line yet.</b> A 7-day average needs at least ${F.ROLLING_MIN_POINTS} weigh-ins inside a 7-day window. You have ${pts.length} readings spread over ${F.daysBetween(pts[0].date, pts[pts.length - 1].date)} days, so only the raw points are drawn. Weigh most mornings for a fortnight and the trend line appears.`;
   } else { note.hidden = true; }
 }
-
 function shortDate(iso) { return localDate(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }); }
 
 function renderCalChart() {
@@ -1176,6 +1237,22 @@ function openSheet(entry = null, category = null) {
   $$('.seg').forEach((s) => (s.hidden = !!entry));
 
   $('#sheet').hidden = false;
+  focusCustom();
+}
+
+/**
+ * Put the cursor in "What was it" when the custom pane is showing.
+ *
+ * Only when it is actually visible: focusing a hidden input scrolls the sheet on iOS and
+ * pops the keyboard over the tile grids he was trying to tap.
+ */
+function focusCustom() {
+  if ($('#sheet-custom').hidden || $('#sheet').hidden) return;
+  // Synchronous on purpose. requestAnimationFrame does not fire on a backgrounded tab, so
+  // deferring meant the cursor was sometimes simply never placed.
+  const f = $('#c-label');
+  f.focus();
+  f.select();
 }
 
 function showTab(tab) {
@@ -1187,6 +1264,7 @@ function showTab(tab) {
 function selectTab(tab) {
   state.pendingTab = tab;
   showTab(tab);
+  focusCustom();
 }
 
 function closeSheet() { $('#sheet').hidden = true; state.editing = null; state.category = null; }
