@@ -377,17 +377,21 @@ th { color: var(--txt2); font-weight: 600; font-size: 11px; text-transform: uppe
 /* ---------- log sheet: keyboard clearance ---------- */
 
 /* --kb is the height the on-screen keyboard covers, set from visualViewport in app.js.
-   Without it the sheet sits under the keyboard on iOS, which is where the typing is.
 
-   Padding rather than `bottom`: the sheet is bottom-anchored with auto height, so padding
-   lifts its contents by exactly the covered height without touching the positioning that
-   the rise animation drives. Capping max-height keeps it scrollable when the keyboard
-   leaves very little room. */
+   The sheet is MOVED up by that much. An earlier version padded it instead and left it
+   anchored at bottom: 0 while also capping its height — which put the whole sheet under
+   the keyboard with nothing to scroll. Bottom and max-height must move together: the
+   sheet occupies the space above the keyboard, or neither value should change.
+
+   `--kb` is clamped in app.js so it can never exceed the room available. */
 :root { --kb: 0px; }
 .sheet-body {
-  padding-bottom: calc(20px + var(--kb) + env(safe-area-inset-bottom));
-  max-height: calc(88dvh - var(--kb));
-  transition: padding-bottom .18s ease-out, max-height .18s ease-out;
+  bottom: var(--kb);
+  /* min(): keep the usual 88dvh cap when there is no keyboard, but when there IS one use
+     all the room above it rather than 88dvh minus the keyboard, which needlessly left ~80px
+     empty and clipped the Add button. */
+  max-height: min(88dvh, calc(100dvh - var(--kb) - 24px));
+  transition: bottom .18s ease-out;
 }
 
 /* ---------- recent items ---------- */

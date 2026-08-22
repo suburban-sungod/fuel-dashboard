@@ -1477,12 +1477,19 @@ function keepVisible(field) {
 function trackKeyboard() {
   const vv = window.visualViewport;
   if (!vv) return;
+  const set = (px) => document.documentElement.style.setProperty('--kb', `${px}px`);
   const apply = () => {
     const sheet = $('#sheet');
-    if (sheet.hidden) { document.documentElement.style.setProperty('--kb', '0px'); return; }
-    // How much of the layout viewport the keyboard (and any browser chrome) covers.
-    const covered = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
-    document.documentElement.style.setProperty('--kb', `${Math.round(covered)}px`);
+    if (sheet.hidden) { set(0); return; }
+    // How much of the layout viewport the keyboard covers. Where the browser honours
+    // interactive-widget=resizes-content the layout viewport has already shrunk, so this
+    // is ~0 and the two mechanisms do not stack.
+    const covered = window.innerHeight - vv.height - vv.offsetTop;
+    // Clamped hard. An over-large value would push the sheet off the top or, worse,
+    // shrink max-height to nothing — the exact failure the padding version shipped with.
+    // Anything under 100px is browser chrome, not a keyboard.
+    const safe = !isFinite(covered) || covered < 100 ? 0 : Math.min(covered, window.innerHeight * 0.6);
+    set(Math.round(safe));
   };
   vv.addEventListener('resize', apply);
   vv.addEventListener('scroll', apply);
