@@ -216,8 +216,8 @@ function wire() {
       addCustom();
     });
   }
-  $('#add-entry').onclick = () => openSheet();
-  $('#add-entry-bottom').onclick = () => openSheet();
+  $('#copy-export').onclick = copyExport;
+  trackKeyboard();
   $('#sync-now').onclick = syncNow;
 }
 
@@ -1066,6 +1066,123 @@ function renderWeight() {
     note.innerHTML = `<b>No rolling average line yet.</b> A 7-day average needs at least ${F.ROLLING_MIN_POINTS} weigh-ins inside a 7-day window. You have ${pts.length} readings spread over ${F.daysBetween(pts[0].date, pts[pts.length - 1].date)} days, so only the raw points are drawn. Weigh most mornings for a fortnight and the trend line appears.`;
   } else { note.hidden = true; }
 }
+/* ---------- export for another LLM ---------- */
+
+/**
+ * The last 7 days as markdown on the clipboard.
+ *
+ * Written to be read by a model with no other context, which is why the method caveats
+ * are in the text rather than left implied: every macro here is an estimate from a typed
+ * description and every expenditure figure is modelled, and a reviewer that assumes
+ * otherwise will over-trust the deficit.
+ */
+function buildExport(days = 7) {
+  const a = state.athlete;
+  const dates = [];
+  for (let i = days - 1; i >= 0; i--) dates.push(F.addDays(state.date, -i));
+
+  const L = [];
+  L.push(`# Food and training log, ${dates[0]} to ${dates[dates.length - 1]}`, '');
+
+  const w = F.weightOn(state.date, state.weights);
+  L.push('## Profile and targets', '');
+  L.push(`- Male, ${a.age}, ${a.height_cm} cm, ${w ? w.kg + ' kg' : 'weight unknown'}, goal ${a.goal_weight_kg} kg`);
+  L.push(`- Protein target ${a.protein_g_per_kg} g/kg, acceptable range ${a.protein_range_g_per_kg.join(' to ')} g/kg`);
+  L.push(`- Planned energy deficit ${a.planned_deficit_kcal} kcal/day`);
+  L.push(`- Fat ${a.fat_pct_range.join(' to ')} percent of intake; minimum ${a.protein_min_per_meal_g} g protein per meal over ${a.meal_min_kcal} kcal`);
+  L.push(`- Cycling FTP ${a.ftp} W`);
+  L.push('- These targets are self-selected, not prescribed by a clinician.', '');
+
+  L.push('## How to read this', '');
+  L.push('- Every macro figure is an LLM estimate from a natural-language description. Nothing was weighed.');
+  L.push('- Expenditure is modelled, not measured: Mifflin-St Jeor BMR, x1.2 for daily living, plus exercise net of the resting burn for those minutes. Cycling energy is recomputed from average power (kJ of work read as kcal, implying roughly 23 to 25 percent gross efficiency).');
+  L.push('- Self-reported intake commonly under-counts by 10 to 20 percent. The direction of the deficit is reliable; the exact figure is not.');
+  L.push('- A positive balance below means a deficit.', '');
+
+  L.push('## Days', '');
+  const rows = [];
+  for (const iso of dates) {
+    const day = state.logs[iso];
+    const entries = day?.entries || [];
+    const t = F.targetsFor(iso, ctx());
+    const tot = F.dayTotals(entries);
+    const dow = localDate(iso).toLocaleDateString(undefined, { weekday: 'long' });
+
+    // Only today is "still open". A past day that was never closed is a different thing
+    // and saying "still open" about it tells a reader to discount a day that is complete.
+    const state_ = iso === state.date ? ' (today, still in progress)' : day?.closed ? '' : ' (never closed, may be incomplete)';
+    L.push(`### ${dow} ${iso}${state_}`, '');
+    if (!entries.length) { L.push('Nothing logged.', ''); continue; }
+
+    const sessions = (t.workouts || []).map((x) => `${x.name} (${x.type}, ${x.duration_min} min${x.avg_watts ? `, ${x.avg_watts} W avg` : ''})`);
+    L.push(`- Day type: ${t.day?.type || 'unknown'}${sessions.length ? `; training: ${sessions.join('; ')}` : '; no training recorded'}`);
+    L.push(`- Weight ${t.weight_kg ?? '?'} kg, modelled TDEE ${num(t.tdee)} kcal, target ${num(t.kcal_target)} kcal`);
+    L.push(`- Intake ${num(tot.kcal)} kcal, protein ${num(tot.protein)} g (target ${num(t.protein_target)}), carbs ${num(tot.carbs)} g, fat ${num(tot.fat)} g`
+      + (tot.kcal ? ` — fat ${Math.round((tot.fat * 9) / tot.kcal * 100)} percent of intake` : ''));
+    if (t.tdee != null) L.push(`- Balance: ${num(t.tdee - tot.kcal)} kcal ${t.tdee - tot.kcal >= 0 ? 'deficit' : 'surplus'}`);
+    if (day?.confounders?.length) L.push(`- Flagged: ${day.confounders.join(', ')}`);
+    L.push('');
+    L.push('| Time | Item | kcal | P | C | F |', '|---|---|---|---|---|---|');
+    for (const e of [...entries].sort((x, y) => (x.time || '').localeCompare(y.time || ''))) {
+      L.push(`| ${e.time} | ${String(e.label).replace(/\|/g, '/')} | ${num(e.kcal)} | ${num(e.protein)} | ${num(e.carbs)} | ${num(e.fat)} |`);
+    }
+    L.push('');
+
+    const short = F.mealClusters(entries, a).filter((c) => c.proteinShort);
+    if (short.length) L.push(`Meals under ${a.protein_min_per_meal_g} g protein: ${short.length} of ${F.mealClusters(entries, a).filter((c) => c.isMeal).length}.`, '');
+    if (t.tdee != null && iso !== state.date) rows.push({ intake: tot.kcal, tdee: t.tdee, protein: tot.protein, fat: tot.fat, closed: !!day?.closed });
+  }
+
+  if (rows.length) {
+    const avg = (f) => Math.round(rows.reduce((s2, r) => s2 + f(r), 0) / rows.length);
+    const nClosed = rows.filter((r) => r.closed).length;
+    L.push('## Averages', '');
+    L.push(`- ${rows.length} complete days (today excluded)${nClosed < rows.length ? `, of which ${nClosed} were explicitly closed` : ''}`);
+    L.push(`- Intake ${num(avg((r) => r.intake))} kcal/day, modelled TDEE ${num(avg((r) => r.tdee))} kcal/day`);
+    L.push(`- Deficit ${num(avg((r) => r.tdee - r.intake))} kcal/day against a planned ${num(a.planned_deficit_kcal)}`);
+    L.push(`- Protein ${num(avg((r) => r.protein))} g/day` + (w ? ` (${(avg((r) => r.protein) / w.kg).toFixed(2)} g/kg)` : ''));
+    L.push(`- Fat ${num(avg((r) => r.fat))} g/day`, '');
+  }
+
+  const roll = F.rollingWeight(state.weights);
+  const rate = F.weightTrendRate(roll);
+  L.push('## Weight', '');
+  L.push('Measured on Garmin scales via TrainingPeaks. No manual entry.', '');
+  L.push('| Date | kg | 7-day average |', '|---|---|---|');
+  const byDate = Object.fromEntries(roll.map((r) => [r.date, r.kg]));
+  for (const x of state.weights) L.push(`| ${x.date} | ${x.kg} | ${byDate[x.date] ? byDate[x.date].toFixed(2) : ''} |`);
+  L.push('');
+  L.push(`- Trend: ${rate == null ? 'not enough span to compute yet' : `${rate.toFixed(2)} kg/week`}`);
+  if (rate != null && w) {
+    const gap = (byDate[state.date] ?? w.kg) - a.goal_weight_kg;
+    if (rate < 0 && gap > 0) L.push(`- At this rate, ${Math.round(gap / Math.abs(rate))} weeks to the ${a.goal_weight_kg} kg goal. Short windows overstate early loss (glycogen and water), so treat this as a ceiling.`);
+  }
+  L.push('');
+  return L.join('\n');
+}
+
+async function copyExport() {
+  const status = $('#copy-export-status');
+  const say = (msg) => { status.hidden = false; status.textContent = msg; };
+  const text = buildExport(7);
+  try {
+    await navigator.clipboard.writeText(text);
+    say(`Copied ${Math.round(text.length / 1024 * 10) / 10} KB. Paste it into Perplexity or Claude.`);
+  } catch {
+    // Clipboard API needs a secure context and can still be refused. A selected textarea
+    // always works and leaves him one keystroke away rather than empty-handed.
+    const ta = el('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:40vh;z-index:99';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); say('Copied.'); }
+    catch { say('Could not reach the clipboard. The text is selected below — copy it manually.'); }
+    setTimeout(() => ta.remove(), 200);
+  }
+  setTimeout(() => { status.hidden = true; }, 6000);
+}
+
 function shortDate(iso) { return localDate(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }); }
 /** Weekday included: it is what makes a Monday spike after a weekend legible at a glance. */
 function longDate(iso) { return localDate(iso).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' }); }
@@ -1293,7 +1410,7 @@ function openSheet(entry = null, category = null) {
   $('#entry-time').value = entry
     ? entry.time
     : `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-  renderTiles();
+  renderRecent();
 
   const custom = { '#c-label': entry?.label ?? '', '#c-kcal': entry?.kcal || '',
     '#c-protein': entry?.protein || '', '#c-carbs': entry?.carbs || '', '#c-fat': entry?.fat || '' };
@@ -1308,6 +1425,7 @@ function openSheet(entry = null, category = null) {
   $$('.seg').forEach((s) => (s.hidden = !!entry));
 
   $('#sheet').hidden = false;
+  window.dispatchEvent(new Event('sheet-toggled'));
   focusCustom();
 }
 
@@ -1324,11 +1442,12 @@ function focusCustom() {
   const f = $('#c-label');
   f.focus();
   f.select();
+  keepVisible(f);
 }
 
 function showTab(tab) {
   $$('.seg-btn').forEach((x) => x.classList.toggle('active', x.dataset.tab === tab));
-  ['meals', 'singles', 'custom'].forEach((t) => { $('#sheet-' + t).hidden = t !== tab; });
+  ['recent', 'custom'].forEach((t) => { $('#sheet-' + t).hidden = t !== tab; });
 }
 
 function selectTab(tab) {
@@ -1336,29 +1455,175 @@ function selectTab(tab) {
   focusCustom();
 }
 
-function closeSheet() { $('#sheet').hidden = true; state.editing = null; state.category = null; }
+/**
+ * Keep the sheet above the on-screen keyboard.
+ *
+ * iOS shrinks `visualViewport` when the keyboard opens but leaves the layout viewport
+ * alone, so a sheet anchored to `bottom: 0` ends up underneath it — which is exactly the
+ * moment he is typing into it. This lifts the sheet by the covered height.
+ */
+/**
+ * Scroll a focused field into view inside the sheet.
+ *
+ * The viewport maths below handles the sheet as a whole; this handles the field within
+ * it, and it is the half that works even where visualViewport reports nothing useful.
+ */
+function keepVisible(field) {
+  setTimeout(() => {
+    try { field.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch { /* older webviews */ }
+  }, 250); // after the keyboard animation, or it scrolls to the pre-keyboard position
+}
 
-function renderTiles() {
-  const grid = $('#sheet-meals');
-  grid.innerHTML = '';
-  for (const m of state.templates.meals) {
-    const t = el('button', 'tile');
-    t.innerHTML = `<span class="t-emoji">${m.emoji || '🍽'}</span>
-      <span class="t-label">${escapeHtml(m.label)}</span>
-      <span class="t-macros">${m.kcal} · ${m.protein}P</span>
-      ${m.source === 'estimate' ? '<span class="t-est">est</span>' : ''}`;
-    t.onclick = () => addEntry(m, 'template');
-    grid.appendChild(t);
+function trackKeyboard() {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const apply = () => {
+    const sheet = $('#sheet');
+    if (sheet.hidden) { document.documentElement.style.setProperty('--kb', '0px'); return; }
+    // How much of the layout viewport the keyboard (and any browser chrome) covers.
+    const covered = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+    document.documentElement.style.setProperty('--kb', `${Math.round(covered)}px`);
+  };
+  vv.addEventListener('resize', apply);
+  vv.addEventListener('scroll', apply);
+  window.addEventListener('sheet-toggled', apply);
+  apply();
+}
+
+function closeSheet() {
+  $('#sheet').hidden = true;
+  state.editing = null;
+  state.category = null;
+  document.documentElement.style.setProperty('--kb', '0px');
+  window.dispatchEvent(new Event('sheet-toggled'));
+}
+
+/**
+ * The last 10 distinct things logged into this meal slot, most recent first.
+ *
+ * Replaces the hand-authored tile grid. His eating is repetitive and slot-specific —
+ * yoghurt is breakfast, Clif Bloks are on the bike — so what he logged into this slot
+ * last week is a far better shortlist than a fixed set of tiles, and it maintains itself.
+ * `templates.json` is untouched and still backs `matchEntry` on the custom pane.
+ */
+function recentForCategory(cat, limit = 10) {
+  const seen = new Map();
+  // Walk backwards from today so the newest version of a repeated item wins.
+  for (let i = 0; i < 120 && seen.size < limit; i++) {
+    const day = state.logs[F.addDays(state.date, -i)];
+    if (!day?.entries?.length) continue;
+    const sorted = [...day.entries].sort((a, b) => (b.time || '').localeCompare(a.time || ''));
+    for (const e of sorted) {
+      if (cat && (e.cat || null) !== cat) continue;
+      if (!e.label || !e.kcal) continue;      // skip pending parses: no macros to scale
+      const key = e.label.trim().toLowerCase();
+      if (seen.has(key)) continue;
+      seen.set(key, e);
+      if (seen.size >= limit) break;
+    }
+  }
+  return [...seen.values()];
+}
+
+/**
+ * Pull an editable amount out of a label: "Greek yoghurt (250g) with…" -> 250g.
+ *
+ * Only the FIRST quantity is treated as the driver. It is almost always the main
+ * ingredient and so carries most of the macros; the trailing "(80g)" of berries is left
+ * alone in the label. Scaling every number by one ratio would be wrong, and scaling them
+ * independently is impossible without per-ingredient macros.
+ */
+const QTY_RE = /(\d+(?:\.\d+)?)\s*(kg|g|ml|l)\b/i;
+function quantityOf(label) {
+  const m = QTY_RE.exec(label || '');
+  return m ? { value: Number(m[1]), unit: m[2], index: m.index, raw: m[0] } : null;
+}
+function relabel(label, qty, next) {
+  return label.slice(0, qty.index) + `${Number(next.toFixed(2))}${qty.unit}` + label.slice(qty.index + qty.raw.length);
+}
+
+function renderRecent() {
+  const list = $('#sheet-recent');
+  list.innerHTML = '';
+  const items = recentForCategory(state.category);
+
+  if (!items.length) {
+    list.appendChild(el('p', 'muted small',
+      state.category
+        ? 'Nothing logged into this meal yet. Use Custom once and it will appear here next time.'
+        : 'Nothing logged yet.'));
+    return;
   }
 
-  const list = $('#sheet-singles');
-  list.innerHTML = '';
-  for (const s of state.templates.singles) {
-    const b = el('button');
-    b.innerHTML = `<span>${escapeHtml(s.label)}${s.source === 'estimate' ? ' <em style="color:var(--warn);font-style:normal">est</em>' : ''}</span>
-      <span>${s.kcal} kcal · ${s.protein}P · ${s.carbs}C · ${s.fat}F</span>`;
-    b.onclick = () => addEntry(s, 'single');
-    list.appendChild(b);
+  for (const item of items) {
+    const qty = quantityOf(item.label);
+    const row = el('div', 'recent-row');
+
+    const head = el('button', 'recent-head');
+    head.innerHTML = `<span class="r-label">${escapeHtml(item.label)}</span>
+      <span class="r-macros">${num(item.kcal)} kcal · ${num(item.protein)}P · ${num(item.carbs)}C · ${num(item.fat)}F</span>`;
+    row.appendChild(head);
+
+    // The amount editor, revealed on tap. Collapsed by default so the common case —
+    // same portion as last time — stays a two-tap add.
+    const edit = el('div', 'recent-edit');
+    edit.hidden = true;
+    const input = el('input');
+    input.type = 'number';
+    input.inputMode = 'decimal';
+    input.step = qty ? '5' : '0.25';
+    input.min = '0';
+    input.value = qty ? String(qty.value) : '1';
+    const unit = el('span', 'r-unit', qty ? qty.unit : '× portion');
+    const preview = el('div', 'r-preview muted small');
+    const add = el('button', 'btn-primary small', 'Add');
+
+    const scaled = () => {
+      const v = Number(input.value);
+      if (!isFinite(v) || v <= 0) return null;
+      const ratio = qty ? v / qty.value : v;
+      return {
+        label: qty ? relabel(item.label, qty, v) : (v === 1 ? item.label : `${item.label} (×${Number(v.toFixed(2))})`),
+        kcal: Math.round(item.kcal * ratio),
+        protein: Math.round(item.protein * ratio),
+        carbs: Math.round(item.carbs * ratio),
+        fat: Math.round(item.fat * ratio),
+        detail: item.note || '',
+      };
+    };
+    const refresh = () => {
+      const sc = scaled();
+      preview.textContent = sc
+        ? `${num(sc.kcal)} kcal · ${num(sc.protein)}P · ${num(sc.carbs)}C · ${num(sc.fat)}F`
+        : 'enter an amount';
+      add.disabled = !sc;
+    };
+    input.addEventListener('input', refresh);
+    input.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' || e.isComposing) return;
+      e.preventDefault();
+      const sc = scaled();
+      if (sc) addEntry(sc, 'recent');
+    });
+    add.onclick = () => { const sc = scaled(); if (sc) addEntry(sc, 'recent'); };
+
+    const amountRow = el('div', 'r-amount');
+    amountRow.appendChild(input);
+    amountRow.appendChild(unit);
+    amountRow.appendChild(add);
+    edit.appendChild(amountRow);
+    edit.appendChild(preview);
+    row.appendChild(edit);
+
+    head.onclick = () => {
+      const opening = edit.hidden;
+      // One open at a time — the sheet is short and two open editors push Add off screen.
+      for (const other of list.querySelectorAll('.recent-edit')) other.hidden = true;
+      edit.hidden = !opening;
+      if (opening) { refresh(); input.focus(); input.select(); keepVisible(input); }
+    };
+
+    list.appendChild(row);
   }
 }
 

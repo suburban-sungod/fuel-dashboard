@@ -79,14 +79,11 @@
     <div class="card">
       <div class="row-between">
         <h2>Meals</h2>
-        <button id="add-entry" class="btn-primary small">+ Log</button>
       </div>
       <div id="entries"></div>
-      <!-- The second Log button is not a duplicate. By dinner the list is long enough that
-           the header button is off screen, and the moment he wants to add food is the
-           moment he has just finished reading the last row. -->
+      <!-- No global Log button. Every entry belongs to a named meal, so the + on each
+           section header is the only way in and the entry always lands categorised. -->
       <div id="meals-footer" class="row-between meals-footer">
-        <button id="add-entry-bottom" class="btn-primary small">+ Log</button>
         <button id="close-day" class="btn-quiet small" hidden></button>
       </div>
     </div>
@@ -146,6 +143,17 @@
         <button id="toggle-table" class="link-btn">Table</button>
       </div>
       <div id="day-table" class="table-wrap" hidden></div>
+    </div>
+
+    <div class="card">
+      <div class="row-between">
+        <h2>Share with an LLM</h2>
+        <button id="copy-export" class="btn-primary small">Copy last 7 days</button>
+      </div>
+      <p class="muted small">Last week of meals, macros, training and the full weight trend, as
+        markdown on your clipboard. Paste it into Perplexity or Claude. Includes the method
+        caveats so the estimates are not read as measurements.</p>
+      <div id="copy-export-status" class="muted small" hidden></div>
     </div>
   </section>
 
@@ -207,13 +215,11 @@
     </div>
 
     <div class="seg">
-      <button class="seg-btn active" data-tab="meals">Meals</button>
-      <button class="seg-btn" data-tab="singles">Items</button>
-      <button class="seg-btn" data-tab="custom">Custom</button>
+      <button class="seg-btn" data-tab="recent">Recent</button>
+      <button class="seg-btn active" data-tab="custom">Custom</button>
     </div>
 
-    <div id="sheet-meals" class="sheet-pane tile-grid"></div>
-    <div id="sheet-singles" class="sheet-pane list" hidden></div>
+    <div id="sheet-recent" class="sheet-pane recent-list" hidden></div>
 
     <div id="sheet-custom" class="sheet-pane" hidden>
       <label for="c-label">What was it</label>

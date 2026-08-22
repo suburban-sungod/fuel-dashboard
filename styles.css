@@ -224,9 +224,11 @@ h2 { font-size: 12px; font-weight: 650; letter-spacing: .05em; text-transform: u
 .cat-head.idle .cat-name, .cat-head.idle .cat-target { opacity: .45; }
 
 .cat-add {
-  flex: none; width: 26px; height: 26px; align-self: center;
-  border-radius: 8px; border: 1px solid var(--border); background: var(--surface2);
-  color: var(--accent); font-size: 17px; line-height: 1; font-family: inherit;
+  /* 44px: the minimum comfortable touch target. This is now the ONLY way to log, so it
+     has to be hittable one-handed without aiming. */
+  flex: none; width: 44px; height: 44px; align-self: center;
+  border-radius: 12px; border: 1px solid var(--border); background: var(--surface2);
+  color: var(--accent); font-size: 24px; line-height: 1; font-family: inherit;
   cursor: pointer; padding: 0;
 }
 .cat-add:active { background: var(--accent); color: #fff; }
@@ -371,3 +373,37 @@ th { color: var(--txt2); font-weight: 600; font-size: 11px; text-transform: uppe
 .chart-tip[hidden] { display: none; }
 .chart-tip b { font-variant-numeric: tabular-nums; }
 .chart-tip .tip-date { color: var(--txt3); font-size: 11px; display: block; }
+
+/* ---------- log sheet: keyboard clearance ---------- */
+
+/* --kb is the height the on-screen keyboard covers, set from visualViewport in app.js.
+   Without it the sheet sits under the keyboard on iOS, which is where the typing is.
+
+   Padding rather than `bottom`: the sheet is bottom-anchored with auto height, so padding
+   lifts its contents by exactly the covered height without touching the positioning that
+   the rise animation drives. Capping max-height keeps it scrollable when the keyboard
+   leaves very little room. */
+:root { --kb: 0px; }
+.sheet-body {
+  padding-bottom: calc(20px + var(--kb) + env(safe-area-inset-bottom));
+  max-height: calc(88dvh - var(--kb));
+  transition: padding-bottom .18s ease-out, max-height .18s ease-out;
+}
+
+/* ---------- recent items ---------- */
+
+.recent-list { display: flex; flex-direction: column; gap: 6px; }
+.recent-row { border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: var(--surface); }
+.recent-head {
+  display: flex; flex-direction: column; gap: 2px; align-items: flex-start;
+  width: 100%; min-height: 52px; padding: 10px 12px;
+  border: 0; background: none; font-family: inherit; text-align: left; cursor: pointer; color: var(--txt);
+}
+.recent-head:active { background: var(--surface2); }
+.recent-head .r-label { font-size: 14px; font-weight: 600; line-height: 1.25; }
+.recent-head .r-macros { font-size: 12px; color: var(--txt2); }
+.recent-edit { padding: 0 12px 12px; border-top: 1px solid var(--border); }
+.r-amount { display: flex; align-items: center; gap: 8px; padding-top: 10px; }
+.r-amount input { width: 96px; font-size: 16px; }  /* 16px: anything smaller zooms iOS */
+.r-amount .r-unit { font-size: 13px; color: var(--txt2); flex: 1; }
+.r-preview { padding-top: 6px; }
